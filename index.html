@@ -348,6 +348,7 @@
         .toast.show { transform: translateY(0); opacity: 1; }
         .toast.success { background: var(--green); color: white; }
         .toast.error { background: var(--red); color: white; }
+        .toast.info { background: var(--blue); color: white; }
 
         .detected-cols { display: flex; flex-wrap: wrap; gap: 8px; margin: 10px 0 20px; }
         .col-tag {
@@ -812,6 +813,10 @@
         fileInput.addEventListener('change', (e) => { if (e.target.files[0]) uploadFile(e.target.files[0]); });
         document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeReport(); });
 
+        if (API_BASE) {
+            setInterval(() => { fetch(`${API_BASE}/`).catch(() => {}); }, 300000);
+        }
+
         async function uploadFile(file) {
             if (!file.name.endsWith('.xlsx') && !file.name.endsWith('.xls')) {
                 showToast('Solo se permiten archivos Excel (.xlsx)', 'error');
@@ -821,9 +826,13 @@
             formData.append('file', file);
             loadingBar.classList.add('active');
             uploadZone.style.opacity = '0.5';
+            showToast('Subiendo archivo... El servidor puede tardar hasta 2 minutos en despertar.', 'info');
 
             try {
-                const res = await fetch(`${API_BASE}/upload`, { method: 'POST', body: formData });
+                const controller = new AbortController();
+                const timeoutId = setTimeout(() => controller.abort(), 180000);
+                const res = await fetch(`${API_BASE}/upload`, { method: 'POST', body: formData, signal: controller.signal });
+                clearTimeout(timeoutId);
                 if (!res.ok) {
                     let msg = 'Error al cargar el archivo';
                     try { const errData = await res.json(); msg = errData.detail || msg; } catch (e) {}
