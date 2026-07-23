@@ -1,9 +1,11 @@
-services:
-  - type: web
-    name: analisis-facturacion
-    runtime: python
-    buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
-    envVars:
-      - key: GEMINI_API_KEY
-        sync: false
+__pycache__/
+*.pyc
+*.pyo
+.env
+uploads/
+~$*
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
