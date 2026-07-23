@@ -1,792 +1,1617 @@
-import os
-import io
-import json
-import shutil
-import tempfile
-import numpy as np
-from pathlib import Path
-from dotenv import load_dotenv
-from fastapi import FastAPI, UploadFile, File, HTTPException, Header, Query
-from fastapi.responses import HTMLResponse, FileResponse, StreamingResponse
-from fastapi.middleware.cors import CORSMiddleware
-from typing import Optional
-
-from analyzer import process_excel, build_vendedor_prompt, get_table_data
-
-
-def to_serializable(obj):
-    if isinstance(obj, dict):
-        return {k: to_serializable(v) for k, v in obj.items()}
-    if isinstance(obj, (list, tuple)):
-        return [to_serializable(v) for v in obj]
-    if isinstance(obj, (np.integer,)):
-        return int(obj)
-    if isinstance(obj, (np.floating,)):
-        return float(obj)
-    if isinstance(obj, np.ndarray):
-        return obj.tolist()
-    return obj
-
-
-GEMINI_MODELS = ["gemini-3.1-flash-lite", "gemini-3-flash-preview", "gemini-3.5-flash"]
-CLAUDE_MODELS = ["claude-sonnet-4-20250514", "claude-3-5-haiku-20241022"]
-OPENAI_MODELS = ["gpt-4o", "gpt-4o-mini"]
-
-
-def _call_gemini(prompt: str, api_key: str) -> str:
-    import google.generativeai as genai
-    genai.configure(api_key=api_key)
-    last_error = None
-    for model_name in GEMINI_MODELS:
-        try:
-            model = genai.GenerativeModel(model_name)
-            response = model.generate_content(prompt)
-            return response.text
-        except Exception as e:
-            last_error = e
-            err_str = str(e).lower()
-            if "429" in err_str or "quota" in err_str or "rate" in err_str:
-                continue
-            raise e
-    raise Exception(f"Todos los modelos Gemini fallaron. Ultimo error: {last_error}")
-
-
-def _call_claude(prompt: str, api_key: str) -> str:
-    import time
-    import anthropic
-    client = anthropic.Anthropic(api_key=api_key)
-    last_error = None
-    for model_name in CLAUDE_MODELS:
-        for attempt in range(3):
-            try:
-                response = client.messages.create(
-                    model=model_name,
-                    max_tokens=8192,
-                    messages=[{"role": "user", "content": prompt}],
-                )
-                return response.content[0].text
-            except Exception as e:
-                last_error = e
-                err_str = str(e).lower()
-                if "429" in err_str or "rate" in err_str or "overloaded" in err_str:
-                    if attempt < 2:
-                        time.sleep(5 * (attempt + 1))
-                        continue
-                    else:
-                        break
-                else:
-                    raise e
-    raise Exception(f"Todos los modelos Claude fallaron. Ultimo error: {last_error}")
-
-
-def _call_openai(prompt: str, api_key: str) -> str:
-    import time
-    from openai import OpenAI
-    client = OpenAI(api_key=api_key)
-    last_error = None
-    for model_name in OPENAI_MODELS:
-        for attempt in range(3):
-            try:
-                response = client.chat.completions.create(
-                    model=model_name,
-                    messages=[{"role": "user", "content": prompt}],
-                    max_tokens=8192,
-                )
-                return response.choices[0].message.content
-            except Exception as e:
-                last_error = e
-                err_str = str(e).lower()
-                if "429" in err_str or "rate" in err_str or "quota" in err_str:
-                    if attempt < 2:
-                        time.sleep(5 * (attempt + 1))
-                        continue
-                    else:
-                        break
-                else:
-                    raise e
-    raise Exception(f"Todos los modelos OpenAI fallaron. Ultimo error: {last_error}")
-
-
-def _call_ai(prompt: str, api_key: str, provider: str = "gemini") -> str:
-    if provider == "claude":
-        return _call_claude(prompt, api_key)
-    elif provider == "openai":
-        return _call_openai(prompt, api_key)
-    else:
-        return _call_gemini(prompt, api_key)
-
-
-CHART_COLORS = ['#4F46E5', '#7C3AED', '#2563EB', '#3B82F6', '#8B5CF6',
-                '#A78BFA', '#C4B5FD', '#DDD6FE', '#6366F1', '#818CF8']
-
-
-def _verify_ai_key(api_key: str, provider: str = "gemini") -> dict:
-    models_tried = []
-    try:
-        if provider == "claude":
-            import anthropic
-            client = anthropic.Anthropic(api_key=api_key)
-            response = client.messages.create(
-                model=CLAUDE_MODELS[0],
-                max_tokens=10,
-                messages=[{"role": "user", "content": "Responde solo: OK"}],
-            )
-            return {"success": True, "model": CLAUDE_MODELS[0], "message": "Conexion exitosa con " + CLAUDE_MODELS[0]}
-        elif provider == "openai":
-            from openai import OpenAI
-            client = OpenAI(api_key=api_key)
-            response = client.chat.completions.create(
-                model=OPENAI_MODELS[0],
-                messages=[{"role": "user", "content": "Responde solo: OK"}],
-                max_tokens=10,
-            )
-            return {"success": True, "model": OPENAI_MODELS[0], "message": "Conexion exitosa con " + OPENAI_MODELS[0]}
-        else:
-            import google.generativeai as genai
-            genai.configure(api_key=api_key)
-            last_err = ""
-            for model_name in GEMINI_MODELS:
-                models_tried.append(model_name)
-                try:
-                    model = genai.GenerativeModel(model_name)
-                    response = model.generate_content("Responde solo: OK")
-                    return {"success": True, "model": model_name, "message": "Conexion exitosa con " + model_name}
-                except Exception as e:
-                    last_err = str(e)
-                    continue
-            raise Exception(last_err or "Todos los modelos fallaron")
-    except Exception as e:
-        err_str = str(e).lower()
-        if "429" in err_str or "quota" in err_str or "rate" in err_str:
-            tried = ", ".join(models_tried) if models_tried else provider
-            raise HTTPException(status_code=429, detail=f"Cuota agotada. Modelos intentados: {tried}. Espera o usa otra API key.")
-        if "invalid" in err_str or "unauthorized" in err_str or "401" in err_str:
-            raise HTTPException(status_code=400, detail="API key invalida para " + provider)
-        raise HTTPException(status_code=400, detail=f"Error verificando {provider}: {str(e)}")
-
-load_dotenv()
-
-app = FastAPI(title="Analisis de Facturacion", version="1.0")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-UPLOAD_DIR = Path("uploads")
-UPLOAD_DIR.mkdir(exist_ok=True)
-
-current_data = {}
-
-
-@app.get("/", response_class=HTMLResponse)
-async def serve_index():
-    html_path = Path("index.html")
-    if html_path.exists():
-        return HTMLResponse(content=html_path.read_text(encoding="utf-8"))
-    return HTMLResponse(content="<h1>index.html no encontrado</h1>", status_code=404)
-
-
-@app.post("/verify-key")
-async def verify_key(
-    x_api_key: Optional[str] = Header(None),
-    x_provider: Optional[str] = Header(None),
-):
-    api_key = x_api_key or ""
-    provider = x_provider or "gemini"
-    if not api_key:
-        raise HTTPException(status_code=400, detail="No se proporciono API key.")
-    return _verify_ai_key(api_key, provider)
-
-
-@app.post("/upload")
-async def upload_excel(file: UploadFile = File(...)):
-    if not file.filename:
-        raise HTTPException(status_code=400, detail="No se envio ningun archivo.")
-
-    if not file.filename.endswith((".xlsx", ".xls")):
-        raise HTTPException(status_code=400, detail="Formato no valido. Solo se permiten archivos Excel (.xlsx)")
-
-    filepath = UPLOAD_DIR / file.filename
-    try:
-        with open(filepath, "wb") as f:
-            shutil.copyfileobj(file.file, f)
-    except PermissionError:
-        raise HTTPException(status_code=500, detail="No se pudo guardar el archivo.")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error al guardar el archivo: {str(e)}")
-
-    if filepath.stat().st_size == 0:
-        filepath.unlink(missing_ok=True)
-        raise HTTPException(status_code=400, detail="El archivo esta vacio.")
-
-    try:
-        result = process_excel(str(filepath))
-        current_data["_df"] = result.pop("_df", None)
-        current_data["result"] = to_serializable(result)
-        current_data["filename"] = file.filename
-        current_data["filepath"] = str(filepath)
-    except ValueError as e:
-        filepath.unlink(missing_ok=True)
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        filepath.unlink(missing_ok=True)
-        raise HTTPException(status_code=500, detail=f"Error al procesar el archivo: {str(e)}")
-
-    return {
-        "success": True,
-        "filename": file.filename,
-        "total_rows": result["total_rows"],
-        "total_unfiltered_rows": result.get("total_unfiltered_rows", result["total_rows"]),
-        "dimensions": len(result["active_dimensions"]),
-        "date_range": result.get("date_range", {}),
-    }
-
-
-@app.post("/refilter")
-async def refilter(filters: str = Query("{}")):
-    if not current_data.get("filepath"):
-        raise HTTPException(status_code=400, detail="No hay archivo cargado.")
-    filepath = current_data["filepath"]
-    if not os.path.exists(filepath):
-        raise HTTPException(status_code=400, detail="El archivo original ya no existe.")
-
-    try:
-        filter_dict = json.loads(filters) if filters else {}
-    except json.JSONDecodeError:
-        filter_dict = {}
-
-    try:
-        result = process_excel(str(filepath), filter_overrides=filter_dict)
-        current_data["_df"] = result.pop("_df", None)
-        current_data["result"] = to_serializable(result)
-        return {
-            "success": True,
-            "filter_overrides": result["filter_overrides"],
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Analisis de Facturacion - Dashboard</title>
+    <style>
+        :root {
+            --bg-primary: #0f1117;
+            --bg-secondary: #1a1d27;
+            --bg-card: #222639;
+            --bg-hover: #2a2e45;
+            --accent: #6366f1;
+            --accent-light: #818cf8;
+            --accent-dark: #4f46e5;
+            --green: #22c55e;
+            --green-bg: rgba(34,197,94,0.12);
+            --red: #ef4444;
+            --red-bg: rgba(239,68,68,0.12);
+            --yellow: #eab308;
+            --yellow-bg: rgba(234,179,8,0.12);
+            --blue: #3b82f6;
+            --blue-bg: rgba(59,130,246,0.12);
+            --text-primary: #e2e8f0;
+            --text-secondary: #94a3b8;
+            --text-muted: #64748b;
+            --border: #334155;
+            --radius: 12px;
+            --radius-sm: 8px;
+            --shadow: 0 4px 24px rgba(0,0,0,0.3);
         }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error al re-filtrar: {str(e)}")
-
-
-@app.get("/data")
-async def get_data():
-    if not current_data.get("result"):
-        raise HTTPException(status_code=400, detail="No hay datos cargados.")
-    return current_data["result"]
-
-
-@app.get("/table-data")
-async def get_table_data_endpoint(
-    page: int = Query(1),
-    page_size: int = Query(50),
-    sort_column: Optional[str] = Query(None),
-    sort_ascending: bool = Query(True),
-    search: Optional[str] = Query(None),
-):
-    if current_data.get("_df") is None:
-        raise HTTPException(status_code=400, detail="No hay datos cargados.")
-    try:
-        result = get_table_data(
-            current_data["_df"],
-            page=page,
-            page_size=page_size,
-            sort_column=sort_column,
-            sort_ascending=sort_ascending,
-            search=search,
-        )
-        return result
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error al obtener datos: {str(e)}")
-
-
-@app.post("/analyze/{dimension_key}/{entity_name}")
-async def analyze_entity(
-    dimension_key: str,
-    entity_name: str,
-    x_api_key: Optional[str] = Header(None),
-    x_provider: Optional[str] = Header(None),
-    filters: Optional[str] = Query("{}"),
-):
-    if not current_data.get("result"):
-        raise HTTPException(status_code=400, detail="No hay datos cargados.")
-
-    api_key = x_api_key or os.getenv("GEMINI_API_KEY", "")
-    provider = x_provider or "gemini"
-    if not api_key:
-        raise HTTPException(status_code=400, detail="No se proporciono API key.")
-
-    result = current_data["result"]
-    active_dims = result["active_dimensions"]
-
-    if dimension_key not in active_dims:
-        raise HTTPException(status_code=400, detail=f"Dimension '{dimension_key}' no encontrada.")
-
-    dim_data = active_dims[dimension_key]
-    entity_data = None
-    for m in dim_data["metrics"]:
-        if m["nombre"].strip().upper() == entity_name.strip().upper():
-            entity_data = m
-            break
-
-    if not entity_data:
-        raise HTTPException(status_code=404, detail=f"Entidad '{entity_name}' no encontrada en dimension '{dimension_key}'.")
-
-    try:
-        filter_dict = json.loads(filters) if filters else {}
-    except json.JSONDecodeError:
-        filter_dict = {}
-
-    prompt = build_vendedor_prompt(entity_data, dim_data["summary"], filter_dict)
-
-    try:
-        informe = _call_ai(prompt, api_key, provider)
-    except Exception as e:
-        err_str = str(e).lower()
-        if "429" in err_str or "quota" in err_str or "rate" in err_str:
-            raise HTTPException(status_code=429, detail="Cuota agotada.")
-        raise HTTPException(status_code=500, detail=f"Error con {provider}: {str(e)}")
-
-    cache_key = f"report_{dimension_key}_{entity_name.strip().upper()}"
-    current_data[cache_key] = informe
-
-    return {
-        "dimension": dimension_key,
-        "entity": entity_name,
-        "informe": informe,
-        "metricas": entity_data,
-    }
-
-
-@app.get("/download/{dimension_key}/{entity_name}/word")
-async def download_word(
-    dimension_key: str,
-    entity_name: str,
-    filters: Optional[str] = Query("{}"),
-):
-    if not current_data.get("result"):
-        raise HTTPException(status_code=400, detail="No hay datos cargados.")
-
-    result = current_data["result"]
-    active_dims = result["active_dimensions"]
-
-    if dimension_key not in active_dims:
-        raise HTTPException(status_code=404, detail="Dimension no encontrada.")
-
-    entity_data = None
-    for m in active_dims[dimension_key]["metrics"]:
-        if m["nombre"].strip().upper() == entity_name.strip().upper():
-            entity_data = m
-            break
-
-    if not entity_data:
-        raise HTTPException(status_code=404, detail="Entidad no encontrada.")
-
-    cache_key = f"report_{dimension_key}_{entity_name.strip().upper()}"
-    informe = current_data.get(cache_key, "")
-    dim_label = active_dims[dimension_key]["label"]
-
-    try:
-        filter_dict = json.loads(filters) if filters else {}
-    except json.JSONDecodeError:
-        filter_dict = {}
-
-    from docx import Document
-    from docx.shared import Inches, Pt, RGBColor
-    from docx.enum.text import WD_ALIGN_PARAGRAPH
-    from docx.enum.table import WD_TABLE_ALIGNMENT
-
-    doc = Document()
-
-    style = doc.styles['Normal']
-    font = style.font
-    font.name = 'Calibri'
-    font.size = Pt(11)
-
-    title = doc.add_heading('', level=0)
-    run = title.add_run(f'Informe de Facturacion - {entity_name}')
-    run.font.color.rgb = RGBColor(79, 70, 229)
-    run.font.size = Pt(22)
-
-    subtitle = doc.add_paragraph()
-    subtitle.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    subtitle_text = f'Dimension: {dim_label}'
-    if filter_dict:
-        subtitle_text += '  |  Filtros: ' + ', '.join(f'{k}={v}' for k, v in filter_dict.items())
-    run = subtitle.add_run(subtitle_text)
-    run.font.size = Pt(10)
-    run.font.color.rgb = RGBColor(100, 116, 139)
-
-    doc.add_paragraph()
-    doc.add_heading('Metricas Principales', level=1)
-    table = doc.add_table(rows=12, cols=2, style='Light Shading Accent 1')
-    table.alignment = WD_TABLE_ALIGNMENT.CENTER
-
-    metrics_data = [
-        ('Valor Neto', f"${entity_data['valor_neto']:,.0f}"),
-        ('Valor Subtotal Local', f"${entity_data['valor_subtotal']:,.0f}"),
-        ('Cantidad Total', f"{entity_data['cantidad']:,.0f} unidades"),
-        ('Costo Total', f"${entity_data['costo_total']:,.0f}"),
-        ('Costo CIF', f"${entity_data['costo_cif']:,.0f}"),
-        ('Utilidad Total', f"${entity_data['utilidad_total']:,.0f}"),
-        ('Margen Promedio', f"{entity_data['margen_promedio']:.1f}%"),
-        ('Margen Total', f"{entity_data['margen_total']:.1f}%"),
-        ('Descuentos', f"${entity_data['valor_descuentos']:,.0f}"),
-        ('Utilidad Promedio', f"${entity_data['utilidad_promedio']:,.0f}"),
-        ('Documentos Unicos', str(entity_data['documentos_unicos'])),
-        ('Total Registros', str(entity_data['total_registros'])),
-    ]
-
-    for i, (label, value) in enumerate(metrics_data):
-        row = table.rows[i]
-        row.cells[0].text = label
-        row.cells[1].text = value
-        for cell in row.cells:
-            for paragraph in cell.paragraphs:
-                for run in paragraph.runs:
-                    run.font.size = Pt(10)
-
-    if entity_data.get("top_items"):
-        doc.add_paragraph()
-        doc.add_heading('Top Items/Productos', level=2)
-        items_table = doc.add_table(rows=len(entity_data["top_items"]) + 1, cols=4, style='Light List Accent 1')
-        for idx, h in enumerate(['Item', 'Valor Neto', 'Cantidad', 'Docs']):
-            items_table.rows[0].cells[idx].text = h
-            for run in items_table.rows[0].cells[idx].paragraphs[0].runs:
-                run.bold = True
-        for i, item in enumerate(entity_data["top_items"]):
-            row = items_table.rows[i + 1]
-            row.cells[0].text = item["item"]
-            row.cells[1].text = f"${item['valor_neto']:,.0f}"
-            row.cells[2].text = f"{item['cantidad']:,.0f}"
-            row.cells[3].text = str(item["registros"])
-
-    if entity_data.get("top_clientes"):
-        doc.add_paragraph()
-        doc.add_heading('Top Clientes', level=2)
-        cl_table = doc.add_table(rows=len(entity_data["top_clientes"]) + 1, cols=4, style='Light List Accent 1')
-        for idx, h in enumerate(['Cliente', 'Valor Neto', 'Cantidad', 'Docs']):
-            cl_table.rows[0].cells[idx].text = h
-            for run in cl_table.rows[0].cells[idx].paragraphs[0].runs:
-                run.bold = True
-        for i, cl in enumerate(entity_data["top_clientes"]):
-            row = cl_table.rows[i + 1]
-            row.cells[0].text = cl["cliente"]
-            row.cells[1].text = f"${cl['valor_neto']:,.0f}"
-            row.cells[2].text = f"{cl['cantidad']:,.0f}"
-            row.cells[3].text = str(cl["registros"])
-
-    if entity_data.get("top_ciudades"):
-        doc.add_paragraph()
-        doc.add_heading('Top Ciudades', level=2)
-        ci_table = doc.add_table(rows=len(entity_data["top_ciudades"]) + 1, cols=4, style='Light List Accent 1')
-        for idx, h in enumerate(['Ciudad', 'Valor Neto', 'Cantidad', 'Docs']):
-            ci_table.rows[0].cells[idx].text = h
-            for run in ci_table.rows[0].cells[idx].paragraphs[0].runs:
-                run.bold = True
-        for i, ci in enumerate(entity_data["top_ciudades"]):
-            row = ci_table.rows[i + 1]
-            row.cells[0].text = ci["ciudad"]
-            row.cells[1].text = f"${ci['valor_neto']:,.0f}"
-            row.cells[2].text = f"{ci['cantidad']:,.0f}"
-            row.cells[3].text = str(ci["registros"])
-
-    if informe:
-        doc.add_page_break()
-        doc.add_heading('Informe de IA', level=1)
-
-        lines = informe.split('\n')
-        i = 0
-        while i < len(lines):
-            stripped = lines[i].strip()
-
-            if stripped.startswith('### '):
-                doc.add_heading(stripped[4:], level=2)
-            elif stripped.startswith('## '):
-                doc.add_heading(stripped[3:], level=1)
-            elif stripped.startswith('# '):
-                doc.add_heading(stripped[2:], level=0)
-            elif stripped.startswith('|') and '|' in stripped[1:]:
-                table_rows = []
-                while i < len(lines) and lines[i].strip().startswith('|'):
-                    row_line = lines[i].strip()
-                    cells = [c.strip() for c in row_line.split('|')[1:-1]]
-                    is_sep = all(c.replace('-', '').replace(':', '').strip() == '' for c in cells)
-                    if not is_sep:
-                        table_rows.append(cells)
-                    i += 1
-                i -= 1
-
-                if table_rows:
-                    num_cols = max(len(r) for r in table_rows)
-                    t = doc.add_table(rows=len(table_rows), cols=num_cols, style='Light Shading Accent 1')
-                    t.alignment = WD_TABLE_ALIGNMENT.CENTER
-                    for ri, row_data in enumerate(table_rows):
-                        for ci, cell_text in enumerate(row_data):
-                            if ci < num_cols:
-                                t.rows[ri].cells[ci].text = cell_text
-                                for paragraph in t.rows[ri].cells[ci].paragraphs:
-                                    for run in paragraph.runs:
-                                        run.font.size = Pt(10)
-                                        if ri == 0:
-                                            run.bold = True
-            elif stripped.startswith('- '):
-                doc.add_paragraph(stripped[2:], style='List Bullet')
-            elif stripped:
-                p = doc.add_paragraph()
-                parts = stripped.split('**')
-                for j, part in enumerate(parts):
-                    run = p.add_run(part)
-                    run.font.size = Pt(11)
-                    if j % 2 == 1:
-                        run.bold = True
-
-            i += 1
-
-    buffer = io.BytesIO()
-    doc.save(buffer)
-    buffer.seek(0)
-
-    safe_name = entity_name.replace(' ', '_').replace('.', '').replace('/', '_')
-    return StreamingResponse(
-        buffer,
-        media_type='application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-        headers={'Content-Disposition': f'attachment; filename="Informe_{safe_name}.docx"'}
-    )
-
-
-@app.get("/download/{dimension_key}/{entity_name}/excel")
-async def download_excel(
-    dimension_key: str,
-    entity_name: str,
-    filters: Optional[str] = Query("{}"),
-):
-    if not current_data.get("result"):
-        raise HTTPException(status_code=400, detail="No hay datos cargados.")
-
-    result = current_data["result"]
-    active_dims = result["active_dimensions"]
-
-    if dimension_key not in active_dims:
-        raise HTTPException(status_code=404, detail="Dimension no encontrada.")
-
-    entity_data = None
-    for m in active_dims[dimension_key]["metrics"]:
-        if m["nombre"].strip().upper() == entity_name.strip().upper():
-            entity_data = m
-            break
-
-    if not entity_data:
-        raise HTTPException(status_code=404, detail="Entidad no encontrada.")
-
-    import openpyxl
-    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-
-    wb = openpyxl.Workbook()
-
-    header_font = Font(name='Calibri', bold=True, size=12, color='FFFFFF')
-    header_fill = PatternFill(start_color='4F46E5', end_color='4F46E5', fill_type='solid')
-    title_font = Font(name='Calibri', bold=True, size=16, color='4F46E5')
-    subtitle_font = Font(name='Calibri', bold=True, size=10, color='64748B')
-    metric_label_font = Font(name='Calibri', bold=True, size=11)
-    metric_value_font = Font(name='Calibri', size=11)
-    thin_border = Border(
-        left=Side(style='thin'), right=Side(style='thin'),
-        top=Side(style='thin'), bottom=Side(style='thin')
-    )
-
-    ws = wb.active
-    ws.title = 'Metricas'
-
-    ws.merge_cells('A1:D1')
-    ws['A1'] = f'Informe de Facturacion - {entity_name}'
-    ws['A1'].font = title_font
-    ws['A1'].alignment = Alignment(horizontal='center')
-
-    dim_label = active_dims[dimension_key]["label"]
-    ws.merge_cells('A2:D2')
-    ws['A2'] = f'Dimension: {dim_label}'
-    ws['A2'].font = subtitle_font
-    ws['A2'].alignment = Alignment(horizontal='center')
-
-    ws['A4'] = 'Metrica'
-    ws['B4'] = 'Valor'
-    ws['A4'].font = header_font
-    ws['A4'].fill = header_fill
-    ws['B4'].font = header_font
-    ws['B4'].fill = header_fill
-    ws['A4'].border = thin_border
-    ws['B4'].border = thin_border
-
-    metrics_data = [
-        ('Valor Neto', entity_data['valor_neto']),
-        ('Valor Subtotal Local', entity_data['valor_subtotal']),
-        ('Cantidad Total', entity_data['cantidad']),
-        ('Costo Total', entity_data['costo_total']),
-        ('Costo CIF', entity_data['costo_cif']),
-        ('Utilidad Total', entity_data['utilidad_total']),
-        ('Margen Promedio (%)', entity_data['margen_promedio']),
-        ('Margen Total (%)', entity_data['margen_total']),
-        ('Descuentos Totales', entity_data['valor_descuentos']),
-        ('Utilidad Promedio', entity_data['utilidad_promedio']),
-        ('Costo Uni. Promedio', entity_data['costo_uni_promedio']),
-        ('Precio Unit. Promedio', entity_data['precio_unit_promedio']),
-        ('Documentos Unicos', entity_data['documentos_unicos']),
-        ('Total Registros', entity_data['total_registros']),
-    ]
-
-    for i, (label, value) in enumerate(metrics_data):
-        row = i + 5
-        ws.cell(row=row, column=1, value=label).font = metric_label_font
-        cell = ws.cell(row=row, column=2, value=value)
-        cell.font = metric_value_font
-        cell.number_format = '#,##0'
-        ws.cell(row=row, column=1).border = thin_border
-        ws.cell(row=row, column=2).border = thin_border
-
-    ws.column_dimensions['A'].width = 30
-    ws.column_dimensions['B'].width = 20
-
-    if entity_data.get("top_items"):
-        ws2 = wb.create_sheet('Top Items')
-        headers2 = ['Item', 'Valor Neto', 'Cantidad', 'Docs']
-        for j, h in enumerate(headers2):
-            cell = ws2.cell(row=1, column=j + 1, value=h)
-            cell.font = header_font
-            cell.fill = header_fill
-        for i, item in enumerate(entity_data["top_items"]):
-            ws2.cell(row=i + 2, column=1, value=item["item"])
-            ws2.cell(row=i + 2, column=2, value=item["valor_neto"])
-            ws2.cell(row=i + 2, column=3, value=item["cantidad"])
-            ws2.cell(row=i + 2, column=4, value=item["registros"])
-        ws2.column_dimensions['A'].width = 50
-        ws2.column_dimensions['B'].width = 18
-        ws2.column_dimensions['C'].width = 12
-        ws2.column_dimensions['D'].width = 10
-
-    if entity_data.get("top_clientes"):
-        ws3 = wb.create_sheet('Top Clientes')
-        headers3 = ['Cliente', 'Valor Neto', 'Cantidad', 'Docs']
-        for j, h in enumerate(headers3):
-            cell = ws3.cell(row=1, column=j + 1, value=h)
-            cell.font = header_font
-            cell.fill = header_fill
-        for i, cl in enumerate(entity_data["top_clientes"]):
-            ws3.cell(row=i + 2, column=1, value=cl["cliente"])
-            ws3.cell(row=i + 2, column=2, value=cl["valor_neto"])
-            ws3.cell(row=i + 2, column=3, value=cl["cantidad"])
-            ws3.cell(row=i + 2, column=4, value=cl["registros"])
-        ws3.column_dimensions['A'].width = 50
-        ws3.column_dimensions['B'].width = 18
-        ws3.column_dimensions['C'].width = 12
-        ws3.column_dimensions['D'].width = 10
-
-    if entity_data.get("top_ciudades"):
-        ws4 = wb.create_sheet('Top Ciudades')
-        headers4 = ['Ciudad', 'Valor Neto', 'Cantidad', 'Docs']
-        for j, h in enumerate(headers4):
-            cell = ws4.cell(row=1, column=j + 1, value=h)
-            cell.font = header_font
-            cell.fill = header_fill
-        for i, ci in enumerate(entity_data["top_ciudades"]):
-            ws4.cell(row=i + 2, column=1, value=ci["ciudad"])
-            ws4.cell(row=i + 2, column=2, value=ci["valor_neto"])
-            ws4.cell(row=i + 2, column=3, value=ci["cantidad"])
-            ws4.cell(row=i + 2, column=4, value=ci["registros"])
-        ws4.column_dimensions['A'].width = 30
-        ws4.column_dimensions['B'].width = 18
-        ws4.column_dimensions['C'].width = 12
-        ws4.column_dimensions['D'].width = 10
-
-    if entity_data.get("estado_dist"):
-        ws5 = wb.create_sheet('Estados')
-        headers5 = ['Estado', 'Docs', 'Valor Neto', 'Cantidad']
-        for j, h in enumerate(headers5):
-            cell = ws5.cell(row=1, column=j + 1, value=h)
-            cell.font = header_font
-            cell.fill = header_fill
-        for i, (estado, d) in enumerate(entity_data["estado_dist"].items()):
-            ws5.cell(row=i + 2, column=1, value=estado)
-            ws5.cell(row=i + 2, column=2, value=d["registros"])
-            ws5.cell(row=i + 2, column=3, value=d["valor_neto"])
-            ws5.cell(row=i + 2, column=4, value=d["cantidad"])
-        ws5.column_dimensions['A'].width = 25
-        ws5.column_dimensions['B'].width = 10
-        ws5.column_dimensions['C'].width = 18
-        ws5.column_dimensions['D'].width = 12
-
-    cache_key = f"report_{dimension_key}_{entity_name.strip().upper()}"
-    informe = current_data.get(cache_key, "")
-    if informe:
-        ws_report = wb.create_sheet('Informe IA')
-        lines = informe.split('\n')
-        row_num = 1
-        i = 0
-        while i < len(lines):
-            stripped = lines[i].strip()
-            if stripped.startswith('# '):
-                ws_report.cell(row=row_num, column=1, value=stripped[2:]).font = Font(name='Calibri', bold=True, size=16, color='4F46E5')
-                ws_report.merge_cells(f'A{row_num}:F{row_num}')
-                row_num += 1
-            elif stripped.startswith('## '):
-                ws_report.cell(row=row_num, column=1, value=stripped[3:]).font = Font(name='Calibri', bold=True, size=13, color='4F46E5')
-                ws_report.merge_cells(f'A{row_num}:F{row_num}')
-                row_num += 1
-            elif stripped.startswith('### '):
-                ws_report.cell(row=row_num, column=1, value=stripped[4:]).font = Font(name='Calibri', bold=True, size=11, color='334155')
-                ws_report.merge_cells(f'A{row_num}:F{row_num}')
-                row_num += 1
-            elif stripped.startswith('|') and '|' in stripped[1:]:
-                table_rows = []
-                while i < len(lines) and lines[i].strip().startswith('|'):
-                    row_line = lines[i].strip()
-                    cells = [c.strip() for c in row_line.split('|')[1:-1]]
-                    is_sep = all(c.replace('-', '').replace(':', '').strip() == '' for c in cells)
-                    if not is_sep:
-                        table_rows.append(cells)
-                    i += 1
-                i -= 1
-                if table_rows:
-                    num_cols = max(len(r) for r in table_rows)
-                    for ri, row_data in enumerate(table_rows):
-                        for ci, cell_text in enumerate(row_data):
-                            if ci < num_cols:
-                                cell = ws_report.cell(row=row_num, column=ci + 1, value=cell_text)
-                                if ri == 0:
-                                    cell.font = header_font
-                                    cell.fill = header_fill
-                                else:
-                                    cell.font = Font(name='Calibri', size=10)
-                                cell.border = thin_border
-                                cell.alignment = Alignment(wrap_text=True)
-                        row_num += 1
-                    row_num += 1
-            elif stripped.startswith('- '):
-                ws_report.cell(row=row_num, column=1, value='  *  ' + stripped[2:]).font = Font(name='Calibri', size=10)
-                row_num += 1
-            elif stripped:
-                ws_report.cell(row=row_num, column=1, value=stripped).font = Font(name='Calibri', size=10)
-                row_num += 1
-            i += 1
-
-        ws_report.column_dimensions['A'].width = 30
-        ws_report.column_dimensions['B'].width = 20
-        ws_report.column_dimensions['C'].width = 20
-
-    buffer = io.BytesIO()
-    wb.save(buffer)
-    buffer.seek(0)
-
-    safe_name = entity_name.replace(' ', '_').replace('.', '').replace('/', '_')
-    return StreamingResponse(
-        buffer,
-        media_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-        headers={'Content-Disposition': f'attachment; filename="Informe_{safe_name}.xlsx"'}
-    )
-
-
-if __name__ == "__main__":
-    import uvicorn
-    port = int(os.environ.get("PORT", 8002))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        body {
+            font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            min-height: 100vh;
+            line-height: 1.6;
+        }
+
+        .header {
+            background: linear-gradient(135deg, var(--bg-secondary), var(--bg-card));
+            border-bottom: 1px solid var(--border);
+            padding: 20px 40px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            position: sticky;
+            top: 0;
+            z-index: 100;
+            backdrop-filter: blur(12px);
+        }
+
+        .header h1 {
+            font-size: 1.4rem;
+            font-weight: 700;
+            background: linear-gradient(135deg, var(--accent-light), var(--accent));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            letter-spacing: -0.5px;
+        }
+
+        .header-subtitle { font-size: 0.85rem; color: var(--text-muted); }
+        .header-right { display: flex; align-items: center; gap: 16px; }
+        .api-key-section { display: flex; align-items: center; gap: 10px; }
+
+        .api-key-section input {
+            background: var(--bg-primary);
+            border: 1px solid var(--border);
+            color: var(--text-primary);
+            padding: 8px 14px;
+            border-radius: var(--radius-sm);
+            font-size: 0.85rem;
+            width: 280px;
+            transition: border-color 0.2s;
+        }
+
+        .api-key-section input:focus { outline: none; border-color: var(--accent); }
+        .api-key-section label { font-size: 0.8rem; color: var(--text-secondary); white-space: nowrap; }
+
+        .api-key-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 5px;
+            padding: 4px 10px;
+            border-radius: 20px;
+            font-size: 0.75rem;
+            font-weight: 600;
+            animation: badgePop 0.3s ease;
+        }
+
+        @keyframes badgePop { 0% { transform: scale(0.8); opacity: 0; } 100% { transform: scale(1); opacity: 1; } }
+
+        .api-key-badge.ok { background: var(--green-bg); color: var(--green); border: 1px solid var(--green); }
+        .api-key-badge.error { background: var(--red-bg); color: var(--red); border: 1px solid var(--red); }
+
+        .btn-clear {
+            padding: 6px 14px; background: var(--bg-card); border: 1px solid var(--border);
+            color: var(--text-secondary); border-radius: var(--radius-sm); cursor: pointer;
+            font-size: 0.8rem; transition: all 0.2s;
+        }
+        .btn-clear:hover { background: var(--red-bg); color: var(--red); border-color: var(--red); }
+
+        .btn-verify {
+            padding: 6px 14px; background: var(--accent-dark); color: white; border: none;
+            border-radius: var(--radius-sm); cursor: pointer; font-size: 0.8rem;
+            font-weight: 600; transition: all 0.2s; white-space: nowrap;
+        }
+        .btn-verify:hover { background: var(--accent); }
+        .btn-verify:disabled { opacity: 0.5; cursor: not-allowed; }
+
+        .container { max-width: 1400px; margin: 0 auto; padding: 30px 40px; }
+
+        .upload-zone {
+            border: 2px dashed var(--border); border-radius: var(--radius);
+            padding: 50px; text-align: center; cursor: pointer; transition: all 0.3s;
+            background: var(--bg-secondary); position: relative;
+        }
+        .upload-zone:hover, .upload-zone.dragover { border-color: var(--accent); background: rgba(99,102,241,0.05); }
+        .upload-zone .icon { font-size: 3rem; margin-bottom: 15px; opacity: 0.6; }
+        .upload-zone h3 { font-size: 1.1rem; margin-bottom: 8px; color: var(--text-primary); }
+        .upload-zone p { color: var(--text-muted); font-size: 0.9rem; }
+        .upload-zone input[type="file"] { display: none; }
+
+        .upload-zone .file-name {
+            margin-top: 15px; padding: 8px 16px; background: var(--accent-dark);
+            color: white; border-radius: var(--radius-sm); display: inline-block; font-size: 0.85rem;
+        }
+
+        .loading-bar {
+            height: 3px; background: var(--bg-card); border-radius: 2px;
+            margin-top: 20px; overflow: hidden; display: none;
+        }
+        .loading-bar.active { display: block; }
+        .loading-bar .fill {
+            height: 100%; background: linear-gradient(90deg, var(--accent), var(--accent-light));
+            animation: loading 1.5s ease-in-out infinite; width: 30%;
+        }
+        @keyframes loading { 0% { transform: translateX(-100%); } 100% { transform: translateX(400%); } }
+
+        .kpi-grid {
+            display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+            gap: 16px; margin: 30px 0;
+        }
+
+        .kpi-card {
+            background: var(--bg-card); border: 1px solid var(--border);
+            border-radius: var(--radius); padding: 20px;
+            transition: transform 0.2s, box-shadow 0.2s;
+        }
+        .kpi-card:hover { transform: translateY(-2px); box-shadow: var(--shadow); }
+        .kpi-card .label {
+            font-size: 0.8rem; color: var(--text-muted); text-transform: uppercase;
+            letter-spacing: 0.5px; margin-bottom: 8px;
+        }
+        .kpi-card .value { font-size: 1.8rem; font-weight: 700; letter-spacing: -1px; }
+        .kpi-card .sub { font-size: 0.8rem; color: var(--text-secondary); margin-top: 4px; }
+        .kpi-card.green .value { color: var(--green); }
+        .kpi-card.red .value { color: var(--red); }
+        .kpi-card.yellow .value { color: var(--yellow); }
+        .kpi-card.blue .value { color: var(--blue); }
+        .kpi-card.accent .value { color: var(--accent-light); }
+
+        .section-title {
+            font-size: 1.2rem; font-weight: 700; margin: 30px 0 16px;
+            padding-bottom: 10px; border-bottom: 1px solid var(--border);
+            display: flex; align-items: center; gap: 10px;
+        }
+        .section-title .badge {
+            font-size: 0.75rem; background: var(--accent-dark); color: white;
+            padding: 3px 10px; border-radius: 20px; font-weight: 500;
+        }
+
+        .filter-panel {
+            background: var(--bg-card); border: 1px solid var(--border);
+            border-radius: var(--radius); padding: 20px; margin: 20px 0;
+        }
+        .filter-panel h3 {
+            font-size: 0.9rem; color: var(--text-secondary); margin-bottom: 14px;
+            text-transform: uppercase; letter-spacing: 0.5px;
+        }
+        .filter-grid {
+            display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+            gap: 12px;
+        }
+        .filter-item label {
+            display: block; font-size: 0.75rem; color: var(--text-muted);
+            margin-bottom: 4px; text-transform: uppercase; letter-spacing: 0.3px;
+        }
+        .filter-item select {
+            width: 100%; padding: 8px 10px; font-size: 0.82rem;
+            border: 1px solid var(--border); border-radius: 6px;
+            background: var(--bg-primary); color: var(--text-primary);
+            cursor: pointer; outline: none; font-family: inherit;
+        }
+        .filter-item select:focus { border-color: var(--accent); }
+        .filter-actions {
+            display: flex; gap: 10px; margin-top: 14px; align-items: center;
+        }
+
+        .dimension-tabs {
+            display: flex; gap: 8px; flex-wrap: wrap; margin: 20px 0;
+        }
+        .dim-tab {
+            padding: 8px 16px; background: var(--bg-card); border: 1px solid var(--border);
+            border-radius: 20px; cursor: pointer; font-size: 0.82rem;
+            color: var(--text-secondary); transition: all 0.2s; font-weight: 500;
+        }
+        .dim-tab:hover { border-color: var(--accent); color: var(--accent-light); }
+        .dim-tab.active {
+            background: var(--accent-dark); color: white; border-color: var(--accent);
+        }
+
+        .entity-grid {
+            display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
+            gap: 16px; margin: 20px 0;
+        }
+
+        .entity-card {
+            background: var(--bg-card); border: 1px solid var(--border);
+            border-radius: var(--radius); padding: 20px; cursor: pointer;
+            transition: all 0.2s; position: relative; overflow: hidden;
+        }
+        .entity-card:hover {
+            border-color: var(--accent); transform: translateY(-2px);
+            box-shadow: 0 8px 32px rgba(99,102,241,0.15);
+        }
+        .entity-card .name { font-size: 1rem; font-weight: 600; margin-bottom: 12px; color: var(--text-primary); }
+        .entity-card .metrics { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+        .entity-card .metric { font-size: 0.8rem; }
+        .entity-card .metric .mlabel { color: var(--text-muted); font-size: 0.7rem; text-transform: uppercase; }
+        .entity-card .metric .mval { font-weight: 600; font-size: 0.95rem; }
+
+        .entity-card .analyze-btn {
+            margin-top: 14px; width: 100%; padding: 10px; background: var(--accent-dark);
+            color: white; border: none; border-radius: var(--radius-sm); cursor: pointer;
+            font-size: 0.85rem; font-weight: 600; transition: background 0.2s;
+        }
+        .entity-card .analyze-btn:hover { background: var(--accent); }
+        .entity-card .analyze-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+        .entity-card .card-actions { display: flex; gap: 8px; margin-top: 10px; }
+        .entity-card .card-actions .btn { flex: 1; justify-content: center; font-size: 0.75rem; padding: 7px 10px; }
+
+        .margen-badge {
+            display: inline-block; padding: 2px 8px; border-radius: 10px;
+            font-size: 0.7rem; font-weight: 600; margin-top: 6px;
+        }
+
+        .margen-badge.high { background: var(--green-bg); color: var(--green); }
+        .margen-badge.mid { background: var(--yellow-bg); color: var(--yellow); }
+        .margen-badge.low { background: var(--red-bg); color: var(--red); }
+
+        .toolbar {
+            display: flex; gap: 12px; margin: 20px 0; align-items: center; flex-wrap: wrap;
+        }
+        .search-box { flex: 1; min-width: 250px; position: relative; }
+        .search-box input {
+            width: 100%; padding: 10px 14px 10px 38px; background: var(--bg-card);
+            border: 1px solid var(--border); color: var(--text-primary);
+            border-radius: var(--radius-sm); font-size: 0.9rem; transition: border-color 0.2s;
+        }
+        .search-box input:focus { outline: none; border-color: var(--accent); }
+        .search-box .search-icon {
+            position: absolute; left: 12px; top: 50%; transform: translateY(-50%);
+            color: var(--text-muted); font-size: 0.9rem; pointer-events: none;
+        }
+
+        .sort-select {
+            padding: 10px 14px; background: var(--bg-card); border: 1px solid var(--border);
+            color: var(--text-primary); border-radius: var(--radius-sm); font-size: 0.85rem; cursor: pointer;
+        }
+        .sort-select:focus { outline: none; border-color: var(--accent); }
+
+        .actions-bar { display: flex; gap: 12px; margin: 20px 0; flex-wrap: wrap; }
+
+        .btn {
+            padding: 12px 24px; border: none; border-radius: var(--radius-sm);
+            cursor: pointer; font-size: 0.9rem; font-weight: 600; transition: all 0.2s;
+            display: inline-flex; align-items: center; gap: 8px;
+        }
+        .btn-primary { background: var(--accent); color: white; }
+        .btn-primary:hover { background: var(--accent-light); }
+        .btn-primary:disabled { opacity: 0.5; cursor: not-allowed; }
+        .btn-secondary { background: var(--bg-card); color: var(--text-primary); border: 1px solid var(--border); }
+        .btn-secondary:hover { background: var(--bg-hover); }
+        .btn-danger { background: var(--red); color: white; }
+        .btn-danger:hover { background: #dc2626; }
+        .btn-word { background: #2b579a; color: white; }
+        .btn-word:hover { background: #3a6bb5; }
+        .btn-excel { background: #217346; color: white; }
+        .btn-excel:hover { background: #2d9259; }
+
+        .report-modal {
+            display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0;
+            background: rgba(0,0,0,0.7); z-index: 200; backdrop-filter: blur(4px);
+            overflow-y: auto; padding: 40px 20px;
+        }
+        .report-modal.active { display: flex; justify-content: center; align-items: flex-start; }
+
+        .report-content {
+            background: var(--bg-secondary); border: 1px solid var(--border);
+            border-radius: var(--radius); max-width: 900px; width: 100%;
+            padding: 30px; position: relative; margin: auto;
+        }
+        .report-content .close-btn {
+            position: absolute; top: 15px; right: 15px; background: var(--bg-card);
+            border: 1px solid var(--border); color: var(--text-primary);
+            width: 36px; height: 36px; border-radius: 50%; cursor: pointer;
+            font-size: 1.2rem; display: flex; align-items: center; justify-content: center;
+            transition: background 0.2s;
+        }
+        .report-content .close-btn:hover { background: var(--red); }
+        .report-content h2 { font-size: 1.3rem; margin-bottom: 20px; padding-bottom: 12px; border-bottom: 1px solid var(--border); color: var(--accent-light); }
+        .report-body { font-size: 0.9rem; line-height: 1.8; color: var(--text-primary); white-space: pre-wrap; }
+        .report-body h3 { font-size: 1.05rem; color: var(--accent-light); margin: 20px 0 10px; padding-bottom: 6px; border-bottom: 1px solid var(--border); }
+        .report-body ul, .report-body ol { padding-left: 24px; margin: 8px 0; }
+        .report-body li { margin: 4px 0; }
+        .report-body strong { color: var(--accent-light); }
+
+        .report-download-bar {
+            display: flex; gap: 10px; margin: 20px 0 10px; padding: 16px;
+            background: var(--bg-card); border-radius: var(--radius-sm);
+            border: 1px solid var(--border); align-items: center; flex-wrap: wrap;
+        }
+        .report-download-bar .dl-label { font-size: 0.85rem; color: var(--text-secondary); font-weight: 600; margin-right: 8px; }
+        .report-download-bar .btn { padding: 8px 18px; font-size: 0.8rem; }
+
+        .empty-state { text-align: center; padding: 60px 20px; color: var(--text-muted); }
+        .empty-state .icon { font-size: 3rem; margin-bottom: 15px; opacity: 0.4; }
+        .empty-state h3 { font-size: 1.1rem; margin-bottom: 8px; color: var(--text-secondary); }
+        .empty-state p { font-size: 0.9rem; }
+
+        .spinner {
+            display: inline-block; width: 18px; height: 18px;
+            border: 2px solid rgba(255,255,255,0.3); border-radius: 50%;
+            border-top-color: white; animation: spin 0.8s linear infinite;
+        }
+        @keyframes spin { to { transform: rotate(360deg); } }
+
+        .toast {
+            position: fixed; bottom: 20px; right: 20px; padding: 14px 24px;
+            border-radius: var(--radius-sm); font-size: 0.85rem; font-weight: 500;
+            z-index: 300; transform: translateY(100px); opacity: 0; transition: all 0.3s;
+        }
+        .toast.show { transform: translateY(0); opacity: 1; }
+        .toast.success { background: var(--green); color: white; }
+        .toast.error { background: var(--red); color: white; }
+
+        .detected-cols { display: flex; flex-wrap: wrap; gap: 8px; margin: 10px 0 20px; }
+        .col-tag {
+            padding: 4px 12px; background: var(--bg-card); border: 1px solid var(--border);
+            border-radius: 20px; font-size: 0.75rem; color: var(--text-secondary);
+        }
+        .col-tag .key { color: var(--accent-light); font-weight: 600; }
+
+        .no-results { text-align: center; padding: 40px 20px; color: var(--text-muted); font-size: 0.9rem; }
+
+        .data-table-section { margin: 30px 0; }
+        .data-table-wrapper {
+            background: var(--bg-card); border: 1px solid var(--border);
+            border-radius: var(--radius); overflow: hidden;
+        }
+        .data-table-toolbar {
+            display: flex; gap: 12px; padding: 16px 20px; align-items: center;
+            border-bottom: 1px solid var(--border); flex-wrap: wrap;
+        }
+        .data-table-toolbar .search-box { min-width: 200px; flex: 1; }
+        .data-table-toolbar .search-box input { padding: 8px 12px 8px 34px; font-size: 0.82rem; }
+        .data-table-toolbar .page-size-select {
+            padding: 8px 10px; background: var(--bg-primary); border: 1px solid var(--border);
+            color: var(--text-primary); border-radius: 6px; font-size: 0.82rem; cursor: pointer;
+        }
+        .data-table-scroll { overflow-x: auto; }
+        .data-table {
+            width: 100%; border-collapse: collapse; font-size: 0.8rem;
+        }
+        .data-table thead th {
+            background: var(--bg-primary); color: var(--text-secondary);
+            padding: 10px 14px; text-align: left; font-weight: 600;
+            border-bottom: 2px solid var(--border); cursor: pointer;
+            white-space: nowrap; user-select: none; position: sticky; top: 0;
+            text-transform: uppercase; letter-spacing: 0.3px; font-size: 0.72rem;
+        }
+        .data-table thead th:hover { color: var(--accent-light); background: var(--bg-hover); }
+        .data-table thead th .sort-arrow { margin-left: 4px; font-size: 0.65rem; opacity: 0.5; }
+        .data-table thead th.sorted .sort-arrow { opacity: 1; color: var(--accent-light); }
+        .data-table tbody tr { border-bottom: 1px solid rgba(51,65,85,0.4); transition: background 0.15s; }
+        .data-table tbody tr:hover { background: var(--bg-hover); }
+        .data-table tbody td {
+            padding: 9px 14px; color: var(--text-primary); white-space: nowrap;
+            max-width: 250px; overflow: hidden; text-overflow: ellipsis;
+        }
+        .data-table tbody td.null-val { color: var(--text-muted); font-style: italic; }
+        .data-table-footer {
+            display: flex; justify-content: space-between; align-items: center;
+            padding: 14px 20px; border-top: 1px solid var(--border); flex-wrap: wrap; gap: 10px;
+        }
+        .data-table-footer .info { font-size: 0.8rem; color: var(--text-muted); }
+        .pagination { display: flex; gap: 4px; align-items: center; }
+        .pagination button {
+            padding: 6px 12px; background: var(--bg-primary); border: 1px solid var(--border);
+            color: var(--text-secondary); border-radius: 6px; cursor: pointer;
+            font-size: 0.8rem; transition: all 0.2s;
+        }
+        .pagination button:hover:not(:disabled) { border-color: var(--accent); color: var(--accent-light); }
+        .pagination button.active { background: var(--accent-dark); color: white; border-color: var(--accent); }
+        .pagination button:disabled { opacity: 0.3; cursor: not-allowed; }
+        .pagination .page-info { font-size: 0.8rem; color: var(--text-muted); padding: 0 8px; }
+
+        .pivot-table-wrap {
+            overflow-x: auto;
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            padding: 0;
+        }
+        .pivot-table-wrap table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 0.85rem;
+        }
+        .pivot-table-wrap table th {
+            background: var(--bg-secondary);
+            color: var(--text-secondary);
+            padding: 10px 14px;
+            text-align: right;
+            font-weight: 600;
+            text-transform: uppercase;
+            font-size: 0.7rem;
+            letter-spacing: 0.5px;
+            border-bottom: 2px solid var(--border);
+            white-space: nowrap;
+            cursor: pointer;
+            user-select: none;
+            position: relative;
+        }
+        .pivot-table-wrap table th:first-child {
+            text-align: left;
+            min-width: 220px;
+            position: sticky;
+            left: 0;
+            z-index: 2;
+            background: var(--bg-secondary);
+        }
+        .pivot-table-wrap table th:hover { color: var(--text-primary); }
+        .pivot-table-wrap table th .sort-icon { font-size: 0.6rem; margin-left: 4px; opacity: 0.4; }
+        .pivot-table-wrap table td {
+            padding: 10px 14px;
+            border-bottom: 1px solid rgba(51,65,85,0.4);
+            color: var(--text-primary);
+            text-align: right;
+            font-variant-numeric: tabular-nums;
+        }
+        .pivot-table-wrap table td:first-child {
+            text-align: left;
+            font-weight: 500;
+            position: sticky;
+            left: 0;
+            z-index: 1;
+            background: var(--bg-card);
+        }
+        .pivot-table-wrap table tbody tr:nth-child(even) td { background: rgba(30,41,59,0.4); }
+        .pivot-table-wrap table tbody tr:nth-child(even) td:first-child { background: rgba(30,41,59,0.7); }
+        .pivot-table-wrap table tbody tr:hover td { background: var(--bg-hover); }
+        .pivot-table-wrap table tbody tr:hover td:first-child { background: var(--bg-hover); }
+        .pivot-table-wrap table .pivot-total-row td {
+            background: rgba(99,102,241,0.08) !important;
+            font-weight: 700;
+            color: var(--accent-light);
+            border-top: 2px solid var(--accent);
+            border-bottom: 2px solid var(--accent);
+        }
+        .pivot-table-wrap table td.cell-currency { color: var(--text-primary); }
+        .pivot-table-wrap table td.cell-zero { color: var(--text-secondary); opacity: 0.5; }
+        .pivot-table-wrap table td.cell-row-num { text-align: center; color: var(--text-secondary); font-size: 0.75rem; width: 40px; min-width: 40px; }
+        .pivot-table-wrap table th.cell-row-num { text-align: center; width: 40px; min-width: 40px; }
+        .pivot-table-wrap table td.cell-expand {
+            text-align: center;
+            width: 32px;
+            min-width: 32px;
+            cursor: pointer;
+            color: var(--text-secondary);
+            font-size: 0.85rem;
+            padding: 8px 6px;
+        }
+        .pivot-table-wrap table th.cell-expand {
+            text-align: center;
+            width: 32px;
+            min-width: 32px;
+        }
+        .pivot-table-wrap table td.cell-expand:hover { color: var(--accent); }
+        .pivot-table-wrap table td.cell-expand .expand-icon {
+            display: inline-block;
+            transition: transform 0.2s ease;
+            font-size: 0.7rem;
+        }
+        .pivot-table-wrap table td.cell-expand.expanded .expand-icon {
+            transform: rotate(90deg);
+        }
+        .pivot-summary-bar {
+            display: flex;
+            gap: 20px;
+            padding: 12px 16px;
+            background: rgba(30,41,59,0.5);
+            border-bottom: 1px solid var(--border);
+            font-size: 0.78rem;
+            flex-wrap: wrap;
+        }
+        .pivot-summary-bar .ps-item { display: flex; align-items: center; gap: 6px; }
+        .pivot-summary-bar .ps-label { color: var(--text-secondary); }
+        .pivot-summary-bar .ps-value { color: var(--text-primary); font-weight: 600; font-variant-numeric: tabular-nums; }
+        .pivot-detail-row td {
+            padding: 0 !important;
+            border-bottom: 1px solid rgba(51,65,85,0.3) !important;
+            background: rgba(15,23,42,0.6) !important;
+        }
+        .pivot-detail-container {
+            padding: 12px 16px 16px 48px;
+            animation: slideDown 0.25s ease;
+        }
+        .pivot-detail-section { margin-bottom: 12px; }
+        .pivot-detail-section:last-child { margin-bottom: 0; }
+        .pivot-detail-header {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 6px 10px;
+            background: rgba(99,102,241,0.08);
+            border-radius: 6px 6px 0 0;
+            border: 1px solid rgba(99,102,241,0.15);
+            border-bottom: none;
+            cursor: pointer;
+            user-select: none;
+        }
+        .pivot-detail-header:hover { background: rgba(99,102,241,0.12); }
+        .pivot-detail-header .detail-title {
+            font-size: 0.75rem;
+            font-weight: 600;
+            color: var(--accent-light);
+            text-transform: uppercase;
+            letter-spacing: 0.3px;
+        }
+        .pivot-detail-header .detail-count {
+            font-size: 0.65rem;
+            color: var(--text-secondary);
+            background: rgba(99,102,241,0.15);
+            padding: 1px 6px;
+            border-radius: 8px;
+        }
+        .pivot-detail-header .detail-toggle {
+            margin-left: auto;
+            font-size: 0.65rem;
+            color: var(--text-secondary);
+        }
+        .pivot-detail-body {
+            border: 1px solid rgba(99,102,241,0.15);
+            border-top: none;
+            border-radius: 0 0 6px 6px;
+            overflow: hidden;
+        }
+        .pivot-detail-body table { font-size: 0.78rem; width: 100%; border-collapse: collapse; }
+        .pivot-detail-body table th {
+            background: rgba(30,41,59,0.8);
+            color: var(--text-secondary);
+            padding: 6px 10px;
+            font-size: 0.68rem;
+            text-transform: uppercase;
+            letter-spacing: 0.3px;
+            border-bottom: 1px solid rgba(51,65,85,0.4);
+            text-align: right;
+        }
+        .pivot-detail-body table th:first-child { text-align: left; }
+        .pivot-detail-body table td {
+            padding: 5px 10px;
+            border-bottom: 1px solid rgba(51,65,85,0.2);
+            font-size: 0.78rem;
+            text-align: right;
+        }
+        .pivot-detail-body table td:first-child {
+            text-align: left;
+            max-width: 320px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        .pivot-detail-body table tbody tr:hover td { background: rgba(99,102,241,0.04); }
+        .items-nested { padding: 2px 0 6px 22px; animation: slideDown 0.2s ease; }
+        .items-sub-table { width: 100%; font-size: 0.7rem; border-collapse: collapse; }
+        .items-sub-table th {
+            font-size: 0.65rem; font-weight: 600; color: var(--text-secondary);
+            text-transform: uppercase; letter-spacing: 0.3px;
+            padding: 4px 8px; border-bottom: 1px solid rgba(51,65,85,0.3); text-align: right;
+            background: rgba(30,41,59,0.6);
+        }
+        .items-sub-table th:first-child { text-align: left; }
+        .items-sub-table td {
+            padding: 4px 8px; border-bottom: 1px solid rgba(51,65,85,0.15);
+            color: var(--text-secondary); max-width: 250px;
+            overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: right;
+        }
+        .items-sub-table td:first-child { text-align: left; }
+        .items-sub-table tr:hover td { background: rgba(99,102,241,0.04); }
+        .items-sub-table th.sortable-th { cursor: pointer; user-select: none; transition: background 0.15s; }
+        .items-sub-table th.sortable-th:hover { background: rgba(79, 70, 229, 0.12); color: var(--accent-light); }
+        .sort-arrow { font-size: 0.5rem; margin-left: 3px; color: var(--accent-light); vertical-align: middle; }
+        .th-search-wrap { display: flex; align-items: center; gap: 4px; }
+        .th-search-input {
+            width: 100%; min-width: 90px;
+            padding: 2px 6px; font-size: 0.65rem;
+            border: 1px solid rgba(51,65,85,0.3);
+            border-radius: 3px;
+            background: rgba(15,23,42,0.5);
+            color: var(--text-primary);
+            outline: none; font-family: inherit;
+        }
+        .th-search-input::placeholder { color: var(--text-secondary); opacity: 0.6; }
+        .th-search-input:focus { border-color: var(--accent); background: rgba(15,23,42,0.8); }
+
+        @media (max-width: 768px) {
+            .header { padding: 15px 20px; flex-direction: column; gap: 12px; }
+            .container { padding: 20px; }
+            .kpi-grid { grid-template-columns: repeat(2, 1fr); }
+            .entity-grid { grid-template-columns: 1fr; }
+            .filter-grid { grid-template-columns: 1fr; }
+            .api-key-section input { width: 100%; }
+            .api-key-section { flex-direction: column; align-items: stretch; }
+            .toolbar { flex-direction: column; }
+            .search-box { min-width: 100%; }
+        }
+    </style>
+</head>
+<body>
+
+    <div class="header">
+        <div>
+            <h1>Analisis de Facturacion</h1>
+            <div class="header-subtitle">Dashboard de gestion y analisis comercial</div>
+        </div>
+        <div class="header-right">
+            <button class="btn-clear" id="clearBtn" style="display:none;" onclick="clearData()">Limpiar datos</button>
+            <div class="api-key-section">
+                <select id="aiProvider" class="sort-select" style="width:auto; font-size:0.8rem;" onchange="onProviderChange()">
+                    <option value="gemini">Gemini</option>
+                    <option value="claude">Claude</option>
+                    <option value="openai">ChatGPT</option>
+                </select>
+                <input type="password" id="apiKey" placeholder="Tu API key..." autocomplete="off">
+                <button class="btn-verify" id="verifyBtn" onclick="verifyApiKey()">Verificar</button>
+                <span class="api-key-badge" id="apiKeyBadge" style="display:none;"></span>
+            </div>
+        </div>
+    </div>
+
+    <div class="container">
+        <div class="upload-zone" id="uploadZone">
+            <div class="icon">&#128193;</div>
+            <h3>Cargar archivo Excel de facturacion</h3>
+            <p>Arrastra el archivo aqui o haz clic para seleccionar</p>
+            <p style="margin-top:8px; font-size:0.8rem;">Soporta archivos .xlsx con datos de facturacion y tabla dinamica</p>
+            <input type="file" id="fileInput" accept=".xlsx,.xls">
+            <div id="fileName" style="display:none;"></div>
+        </div>
+        <div class="loading-bar" id="loadingBar"><div class="fill"></div></div>
+
+        <div id="dashboard" style="display:none;">
+            <div class="kpi-grid" id="kpiGrid"></div>
+
+            <div id="filterPanel" style="display:none;">
+                <div class="filter-panel">
+                    <h3>Filtros de Datos</h3>
+                    <div class="filter-grid" id="filterGrid"></div>
+                    <div class="filter-actions">
+                        <button class="btn btn-primary" onclick="applyFilters()" style="font-size:0.82rem; padding:8px 18px;">Aplicar Filtros</button>
+                        <button class="btn btn-secondary" onclick="resetFilters()" style="font-size:0.82rem; padding:8px 18px;">Limpiar</button>
+                        <span id="filterStatus" style="font-size:0.75rem; color:var(--text-muted);"></span>
+                    </div>
+                </div>
+            </div>
+
+            <div id="pivotSection" style="display:none;">
+                <div class="section-title">
+                    <span style="display:flex; align-items:center; gap:8px;">
+                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <rect x="3" y="3" width="7" height="7"/>
+                            <rect x="14" y="3" width="7" height="7"/>
+                            <rect x="3" y="14" width="7" height="7"/>
+                            <rect x="14" y="14" width="7" height="7"/>
+                        </svg>
+                        Tabla Dinamica
+                    </span>
+                    <span class="badge" id="pivotBadge"></span>
+                </div>
+                <div class="pivot-table-wrap" id="pivotWrap"></div>
+            </div>
+
+            <div id="detectedSection" style="display:none;">
+                <div class="section-title">Columnas detectadas</div>
+                <div class="detected-cols" id="detectedCols"></div>
+            </div>
+
+            <div id="dimensionSection" style="display:none;">
+                <div class="section-title">Dimension de Analisis</div>
+                <div class="dimension-tabs" id="dimTabs"></div>
+            </div>
+
+            <div class="toolbar">
+                <div class="search-box">
+                    <span class="search-icon">&#128269;</span>
+                    <input type="text" id="searchInput" placeholder="Buscar por nombre..." oninput="filterEntities()">
+                </div>
+                <select class="sort-select" id="sortSelect" onchange="filterEntities()">
+                    <option value="valor_neto-desc">Valor Neto (mayor)</option>
+                    <option value="valor_neto-asc">Valor Neto (menor)</option>
+                    <option value="cantidad-desc">Cantidad (mayor)</option>
+                    <option value="margen-desc">Margen (mayor)</option>
+                    <option value="margen-asc">Margen (menor)</option>
+                    <option value="registros-desc">Registros (mayor)</option>
+                    <option value="nombre-asc">Nombre A-Z</option>
+                    <option value="nombre-desc">Nombre Z-A</option>
+                </select>
+            </div>
+
+            <div class="section-title">
+                Entidades
+                <span class="badge" id="entityCount"></span>
+            </div>
+
+            <div class="entity-grid" id="entityGrid"></div>
+            <div class="no-results" id="noResults" style="display:none;">No se encontraron resultados</div>
+
+            <div class="data-table-section" id="dataTableSection" style="display:none;">
+                <div class="section-title">
+                    Tabla de Datos
+                    <span class="badge" id="tableRowCount"></span>
+                </div>
+                <div class="data-table-wrapper">
+                    <div class="data-table-toolbar">
+                        <div class="search-box">
+                            <span class="search-icon">&#128269;</span>
+                            <input type="text" id="tableSearch" placeholder="Buscar en toda la tabla..." oninput="onTableSearch()">
+                        </div>
+                        <select class="page-size-select" id="pageSizeSelect" onchange="onPageSizeChange()">
+                            <option value="25">25 filas</option>
+                            <option value="50" selected>50 filas</option>
+                            <option value="100">100 filas</option>
+                            <option value="250">250 filas</option>
+                        </select>
+                    </div>
+                    <div class="data-table-scroll">
+                        <table class="data-table" id="dataTable">
+                            <thead id="dataTableHead"></thead>
+                            <tbody id="dataTableBody"></tbody>
+                        </table>
+                    </div>
+                    <div class="data-table-footer">
+                        <div class="info" id="tableInfo"></div>
+                        <div class="pagination" id="tablePagination"></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div class="empty-state" id="emptyState">
+            <div class="icon">&#128202;</div>
+            <h3>Sin datos cargados</h3>
+            <p>Sube un archivo Excel de facturacion para comenzar el analisis</p>
+        </div>
+    </div>
+
+    <div class="report-modal" id="reportModal">
+        <div class="report-content">
+            <button class="close-btn" onclick="closeReport()">&times;</button>
+            <h2 id="reportTitle"></h2>
+            <div class="report-download-bar" id="reportDownloadBar" style="display:none;">
+                <span class="dl-label">Descargar informe:</span>
+                <button class="btn btn-word" onclick="downloadCurrentReport('word')">Word (.docx)</button>
+                <button class="btn btn-excel" onclick="downloadCurrentReport('excel')">Excel (.xlsx)</button>
+            </div>
+            <div class="report-body" id="reportBody"></div>
+        </div>
+    </div>
+
+    <div class="toast" id="toast"></div>
+
+    <script>
+        const API_BASE = location.hostname === 'localhost' || location.hostname === '127.0.0.1'
+            ? ''
+            : 'https://analisis-facturacion.onrender.com';
+        let appData = null;
+        let currentReportEntity = '';
+        let currentReportDim = '';
+        let currentFilters = {};
+        let toastTimer = null;
+        let tableState = { page: 1, pageSize: 50, sortCol: null, sortAsc: true, search: '' };
+        let tableSearchTimer = null;
+
+        const uploadZone = document.getElementById('uploadZone');
+        const fileInput = document.getElementById('fileInput');
+        const loadingBar = document.getElementById('loadingBar');
+
+        uploadZone.addEventListener('click', () => fileInput.click());
+        uploadZone.addEventListener('dragover', (e) => { e.preventDefault(); uploadZone.classList.add('dragover'); });
+        uploadZone.addEventListener('dragleave', () => { uploadZone.classList.remove('dragover'); });
+        uploadZone.addEventListener('drop', (e) => {
+            e.preventDefault();
+            uploadZone.classList.remove('dragover');
+            if (e.dataTransfer.files[0]) uploadFile(e.dataTransfer.files[0]);
+        });
+        fileInput.addEventListener('change', (e) => { if (e.target.files[0]) uploadFile(e.target.files[0]); });
+        document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeReport(); });
+
+        async function uploadFile(file) {
+            if (!file.name.endsWith('.xlsx') && !file.name.endsWith('.xls')) {
+                showToast('Solo se permiten archivos Excel (.xlsx)', 'error');
+                return;
+            }
+            const formData = new FormData();
+            formData.append('file', file);
+            loadingBar.classList.add('active');
+            uploadZone.style.opacity = '0.5';
+
+            try {
+                const res = await fetch(`${API_BASE}/upload`, { method: 'POST', body: formData });
+                if (!res.ok) {
+                    let msg = 'Error al cargar el archivo';
+                    try { const errData = await res.json(); msg = errData.detail || msg; } catch (e) {}
+                    showToast(msg, 'error');
+                    return;
+                }
+                const data = await res.json();
+                document.getElementById('fileName').style.display = 'inline-block';
+                document.getElementById('fileName').className = 'file-name';
+                document.getElementById('fileName').textContent = data.filename;
+                document.getElementById('clearBtn').style.display = 'inline-flex';
+
+                const filterMsg = data.total_unfiltered_rows > data.total_rows
+                    ? ` (de ${data.total_unfiltered_rows} totales)` : '';
+                showToast(`Archivo cargado: ${data.total_rows} registros, ${data.dimensions} dimensiones${filterMsg}`, 'success');
+                await loadData();
+            } catch (err) {
+                showToast('Error de conexion. Verifica que el servidor este corriendo.', 'error');
+                console.error(err);
+            } finally {
+                loadingBar.classList.remove('active');
+                uploadZone.style.opacity = '1';
+            }
+        }
+
+        async function loadData() {
+            try {
+                const res = await fetch(`${API_BASE}/data`);
+                if (!res.ok) { showToast('Error cargando datos', 'error'); return; }
+                appData = await res.json();
+                renderDashboard();
+            } catch (err) {
+                showToast('Error de conexion al cargar datos', 'error');
+                console.error(err);
+            }
+        }
+
+        function renderDashboard() {
+            document.getElementById('emptyState').style.display = 'none';
+            document.getElementById('dashboard').style.display = 'block';
+            renderKPIs();
+            renderFilters();
+            renderPivotTable();
+            renderDetectedColumns();
+            renderDimensionTabs();
+            filterEntities();
+            loadTableData();
+        }
+
+        function renderKPIs() {
+            const dims = appData.active_dimensions;
+            const primaryDim = appData.primary_dimension;
+            const summary = dims[primaryDim]?.summary || {};
+            const grid = document.getElementById('kpiGrid');
+            grid.innerHTML = `
+                <div class="kpi-card green">
+                    <div class="label">Valor Neto Total</div>
+                    <div class="value">${formatCurrency(summary.total_valor_neto || 0)}</div>
+                    <div class="sub">${summary.total_documentos_unicos || 0} documentos</div>
+                </div>
+                <div class="kpi-card accent">
+                    <div class="label">Cantidad Total</div>
+                    <div class="value">${formatNum(summary.total_cantidad || 0)}</div>
+                    <div class="sub">unidades vendidas</div>
+                </div>
+                <div class="kpi-card red">
+                    <div class="label">Costo Total</div>
+                    <div class="value">${formatCurrency(summary.total_costo || 0)}</div>
+                    <div class="sub">inventario + CIF</div>
+                </div>
+                <div class="kpi-card yellow">
+                    <div class="label">Utilidad Total</div>
+                    <div class="value">${formatCurrency(summary.total_utilidad || 0)}</div>
+                    <div class="sub">ganancia neta</div>
+                </div>
+                <div class="kpi-card blue">
+                    <div class="label">Margen General</div>
+                    <div class="value">${summary.margen_general || 0}%</div>
+                    <div class="sub">margen promedio: ${summary.margen_promedio || 0}%</div>
+                </div>
+                <div class="kpi-card accent">
+                    <div class="label">Descuentos</div>
+                    <div class="value">${formatCurrency(summary.total_descuentos || 0)}</div>
+                    <div class="sub">${summary.total_registros || 0} registros</div>
+                </div>
+            `;
+        }
+
+        function renderPivotTable() {
+            const pivot = appData.pivot_table;
+            if (!pivot || !pivot.data || pivot.data.length === 0) return;
+
+            document.getElementById('pivotSection').style.display = 'block';
+            document.getElementById('pivotBadge').textContent = pivot.data.length + ' filas';
+
+            const wrap = document.getElementById('pivotWrap');
+            if (!pivot.headers) return;
+
+            const cleanHeaders = pivot.headers;
+            const expandedCanals = {};
+            const expandedVendedores = {};
+            const expandedDocs = {};
+            const itemSearch = {};
+            const itemSort = {};
+
+            window.toggleCanal = function(canalIdx) {
+                expandedCanals[canalIdx] = !expandedCanals[canalIdx];
+                render();
+            };
+            window.toggleVendedor = function(canalIdx, venIdx) {
+                const key = canalIdx + '_' + venIdx;
+                expandedVendedores[key] = !expandedVendedores[key];
+                render();
+            };
+            window.toggleDoc = function(canalIdx, venIdx, docIdx) {
+                const key = canalIdx + '_' + venIdx + '_' + docIdx;
+                expandedDocs[key] = !expandedDocs[key];
+                render();
+            };
+            window.sortDocItems = function(cKey, colIdx) {
+                const curr = itemSort[cKey];
+                itemSort[cKey] = curr && curr.col === colIdx ? { col: colIdx, asc: !curr.asc } : { col: colIdx, asc: colIdx === 0 };
+                render();
+            };
+            window.filterDocItems = function(cKey, value) {
+                itemSearch[cKey] = value;
+                render();
+            };
+
+            function getSortedItems(items, cKey) {
+                const filter = (itemSearch[cKey] || '').toLowerCase();
+                let result = filter ? items.filter(it => it.item.toLowerCase().includes(filter)) : [...items];
+                const s = itemSort[cKey];
+                const keys = ['item', 'cantidad', 'valor_subtotal', 'valor_neto', 'costo_total', 'utilidad'];
+                const sk = s ? keys[s.col] : 'valor_neto';
+                const asc = s ? s.asc : false;
+                return result.sort((a, b) => {
+                    const va = a[sk], vb = b[sk];
+                    if (typeof va === 'string') return asc ? va.localeCompare(vb) : vb.localeCompare(va);
+                    return asc ? va - vb : vb - va;
+                });
+            }
+
+            function fc(val, colIdx) {
+                if (val === null || val === undefined) return '';
+                if (typeof val === 'number') {
+                    if (colIdx === 7) return val.toFixed(1) + '%';
+                    return val.toLocaleString('es-CO', { maximumFractionDigits: 0 });
+                }
+                return val;
+            }
+
+            function render() {
+                const h = pivot.hierarchy || {};
+                const dataRows = pivot.data;
+                const canales = Object.keys(h);
+
+                let html = '<div class="pivot-summary-bar">';
+                const totalRow = dataRows.find(r => r[0] && String(r[0]).toLowerCase().includes('total'));
+                if (totalRow) {
+                    html += '<div class="ps-item"><span class="ps-label">Registros:</span><span class="ps-value">' + (totalRow[9] || 0).toLocaleString('es-CO') + '</span></div>';
+                    html += '<div class="ps-item"><span class="ps-label">Valor Neto:</span><span class="ps-value">$' + (totalRow[4] || 0).toLocaleString('es-CO') + '</span></div>';
+                    html += '<div class="ps-item"><span class="ps-label">Utilidad:</span><span class="ps-value">$' + (totalRow[6] || 0).toLocaleString('es-CO') + '</span></div>';
+                    const m = totalRow[7] || 0;
+                    html += '<div class="ps-item"><span class="ps-label">Margen:</span><span class="ps-value" style="color:' + (m > 30 ? '#34d399' : m > 15 ? '#fbbf24' : '#f87171') + '">' + m + '%</span></div>';
+                }
+                html += '</div><div style="overflow-x:auto;"><table><thead><tr>';
+                html += '<th class="cell-expand"></th><th class="cell-row-num">#</th>';
+                cleanHeaders.forEach(h => { html += '<th>' + h + '</th>'; });
+                html += '</tr></thead><tbody>';
+
+                let rowIdx = 0;
+                canales.forEach((canalName, ci) => {
+                    const vendedores = h[canalName];
+                    const venNames = Object.keys(vendedores);
+                    const canalRow = dataRows.find(r => r[0] === canalName && r[1] === '(todos)');
+                    if (!canalRow) return;
+
+                    const isExp = expandedCanals[ci];
+                    html += '<tr>';
+                    html += '<td class="cell-expand' + (isExp ? ' expanded' : '') + '" onclick="toggleCanal(' + ci + ')"><span class="expand-icon">&#9654;</span></td>';
+                    html += '<td class="cell-row-num">' + (++rowIdx) + '</td>';
+                    canalRow.forEach((cell, i) => {
+                        if (i === 0) html += '<td style="font-weight:700;color:var(--accent-light)">' + escHtml(cell || '') + '</td>';
+                        else if (i === 1) html += '<td style="font-style:italic;color:var(--text-muted)">' + venNames.length + ' vendedores</td>';
+                        else html += '<td style="font-weight:700">' + fc(cell, i) + '</td>';
+                    });
+                    html += '</tr>';
+
+                    if (isExp) {
+                        venNames.forEach((venName, vi) => {
+                            const venData = vendedores[venName];
+                            const venRow = dataRows.find(r => r[0] === '' && r[1] === venName);
+                            if (!venRow) return;
+                            const vk = ci + '_' + vi;
+                            const isVExp = expandedVendedores[vk];
+                            const documentos = venData.documentos || {};
+                            const docNames = Object.keys(documentos);
+                            const hasDocs = docNames.length > 0;
+
+                            html += '<tr>';
+                            html += '<td class="cell-expand' + (isVExp ? ' expanded' : '') + '"' + (hasDocs ? ' onclick="toggleVendedor(' + ci + ',' + vi + ')"' : '') + '><span class="expand-icon">' + (hasDocs ? '&#9654;' : '') + '</span></td>';
+                            html += '<td class="cell-row-num">' + (++rowIdx) + '</td>';
+                            venRow.forEach((cell, i) => {
+                                if (i === 0) html += '<td></td>';
+                                else if (i === 1) html += '<td style="font-weight:600">' + escHtml(cell || '') + '</td>';
+                                else html += '<td>' + fc(cell, i) + '</td>';
+                            });
+                            html += '</tr>';
+
+                            if (isVExp && hasDocs) {
+                                docNames.forEach((docName, di) => {
+                                    const docData = documentos[docName];
+                                    const dk = ci + '_' + vi + '_' + di;
+                                    const isDExp = expandedDocs[dk];
+                                    const items = docData.items || [];
+                                    const hasItems = items.length > 0;
+
+                                    html += '<tr>';
+                                    html += '<td class="cell-expand' + (isDExp ? ' expanded' : '') + '"' + (hasItems ? ' onclick="toggleDoc(' + ci + ',' + vi + ',' + di + ')"' : '') + '><span class="expand-icon">' + (hasItems ? '&#9654;' : '') + '</span></td>';
+                                    html += '<td class="cell-row-num" style="font-size:0.65rem;color:var(--text-muted)">' + (++rowIdx) + '</td>';
+                                    html += '<td style="padding-left:28px;font-family:monospace;font-size:0.78rem;color:var(--accent-light);font-weight:500">' + escHtml(docName) + '</td>';
+                                    html += '<td style="text-align:right">' + docData.cantidad.toLocaleString('es-CO') + '</td>';
+                                    html += '<td style="text-align:right">$' + docData.valor_subtotal.toLocaleString('es-CO') + '</td>';
+                                    html += '<td style="text-align:right;font-weight:600">$' + docData.valor_neto.toLocaleString('es-CO') + '</td>';
+                                    html += '<td style="text-align:right">$' + docData.costo_total.toLocaleString('es-CO') + '</td>';
+                                    html += '<td style="text-align:right">$' + docData.utilidad.toLocaleString('es-CO') + '</td>';
+                                    html += '<td style="text-align:right">' + docData.margen + '%</td>';
+                                    html += '<td style="text-align:right">' + docData.registros + '</td>';
+                                    html += '</tr>';
+
+                                    if (isDExp && hasItems) {
+                                        const s = itemSort[dk] || { col: 4, asc: false };
+                                        const sorted = getSortedItems(items, dk);
+                                        const iH = ['Producto', 'Cantidad', 'V. Subtotal', 'V. Neto', 'Costo', 'Utilidad'];
+
+                                        html += '<tr class="pivot-detail-row"><td colspan="' + (cleanHeaders.length + 2) + '">';
+                                        html += '<div class="pivot-detail-container"><div class="pivot-detail-section">';
+                                        html += '<div class="pivot-detail-header">';
+                                        html += '<span class="detail-title">Productos</span>';
+                                        html += '<span class="detail-count">' + items.length + ' items</span>';
+                                        html += '</div><div class="pivot-detail-body"><div class="items-nested">';
+                                        html += '<table class="items-sub-table"><thead><tr>';
+
+                                        iH.forEach((label, ii) => {
+                                            const active = s.col === ii;
+                                            const arrow = active ? '<span class="sort-arrow">' + (s.asc ? '&#9650;' : '&#9660;') + '</span>' : '';
+                                            if (ii === 0) {
+                                                const sv = (itemSearch[dk] || '').replace(/"/g, '&quot;');
+                                                html += '<th class="sortable-th" style="text-align:left;padding:3px 4px"><div class="th-search-wrap">';
+                                                html += '<input class="th-search-input" type="text" placeholder="Buscar item..." oninput="filterDocItems(\'' + dk + '\',this.value)" onclick="event.stopPropagation()" value="' + sv + '">';
+                                                html += '<span class="sort-arrow sort-click" onclick="sortDocItems(\'' + dk + '\',0)">' + (arrow || '&#9650;&#9660;') + '</span>';
+                                                html += '</div></th>';
+                                            } else {
+                                                html += '<th class="sortable-th" onclick="sortDocItems(\'' + dk + '\',' + ii + ')" style="text-align:right">' + label + arrow + '</th>';
+                                            }
+                                        });
+                                        html += '</tr></thead><tbody>';
+                                        sorted.forEach(it => {
+                                            html += '<tr><td title="' + escHtml(it.item) + '">' + escHtml(it.item) + '</td>';
+                                            html += '<td>' + it.cantidad.toLocaleString('es-CO') + '</td>';
+                                            html += '<td>$' + it.valor_subtotal.toLocaleString('es-CO') + '</td>';
+                                            html += '<td>$' + it.valor_neto.toLocaleString('es-CO') + '</td>';
+                                            html += '<td>$' + it.costo_total.toLocaleString('es-CO') + '</td>';
+                                            html += '<td>$' + it.utilidad.toLocaleString('es-CO') + '</td></tr>';
+                                        });
+                                        html += '</tbody></table></div></div></div></div>';
+                                        html += '</td></tr>';
+                                    }
+                                });
+                            }
+                        });
+                    }
+                });
+
+                if (totalRow) {
+                    html += '<tr class="pivot-total-row"><td class="cell-expand"></td><td class="cell-row-num"></td>';
+                    totalRow.forEach((cell, i) => {
+                        if (cell === null || cell === undefined) html += '<td></td>';
+                        else if (typeof cell === 'number') html += '<td>' + fc(cell, i) + '</td>';
+                        else html += '<td style="font-weight:700;color:var(--accent-light)">' + cell + '</td>';
+                    });
+                    html += '</tr>';
+                }
+                html += '</tbody></table></div>';
+                wrap.innerHTML = html;
+            }
+            render();
+        }
+
+        function renderFilters() {
+            const options = appData.filter_options;
+            if (!options || Object.keys(options).length === 0) return;
+            document.getElementById('filterPanel').style.display = 'block';
+            const grid = document.getElementById('filterGrid');
+            grid.innerHTML = '';
+            for (const [key, opt] of Object.entries(options)) {
+                const item = document.createElement('div');
+                item.className = 'filter-item';
+                const saved = currentFilters[key] || '';
+                item.innerHTML = `<label>${opt.label}</label>
+                    <select id="filter_${key}" data-key="${key}">
+                        <option value="__ALL__">Todos</option>
+                        ${opt.values.map(v => `<option value="${escHtml(v)}" ${v === saved ? 'selected' : ''}>${escHtml(v)}</option>`).join('')}
+                    </select>`;
+                grid.appendChild(item);
+            }
+        }
+
+        function renderDetectedColumns() {
+            const cols = appData.detected_columns;
+            if (!cols || Object.keys(cols).length === 0) return;
+            document.getElementById('detectedSection').style.display = 'block';
+            const container = document.getElementById('detectedCols');
+            container.innerHTML = Object.entries(cols)
+                .filter(([k, v]) => v !== null)
+                .map(([k, v]) => `<span class="col-tag"><span class="key">${k}</span>: ${v}</span>`)
+                .join('');
+        }
+
+        function renderDimensionTabs() {
+            const dims = appData.active_dimensions;
+            if (!dims) return;
+            document.getElementById('dimensionSection').style.display = 'block';
+            const tabs = document.getElementById('dimTabs');
+            tabs.innerHTML = '';
+            const dimKeys = Object.keys(dims);
+            dimKeys.forEach(key => {
+                const tab = document.createElement('div');
+                tab.className = 'dim-tab' + (key === appData.primary_dimension ? ' active' : '');
+                tab.textContent = dims[key].label + ` (${dims[key].metrics.length})`;
+                tab.onclick = () => {
+                    appData.primary_dimension = key;
+                    document.querySelectorAll('.dim-tab').forEach(t => t.classList.remove('active'));
+                    tab.classList.add('active');
+                    filterEntities();
+                };
+                tabs.appendChild(tab);
+            });
+        }
+
+        function filterEntities() {
+            if (!appData) return;
+            const primaryDim = appData.primary_dimension;
+            const dims = appData.active_dimensions;
+            if (!dims[primaryDim]) return;
+
+            let metrics = [...dims[primaryDim].metrics];
+            const query = (document.getElementById('searchInput').value || '').toLowerCase().trim();
+            const sortVal = document.getElementById('sortSelect').value;
+
+            if (query) {
+                metrics = metrics.filter(m => m.nombre.toLowerCase().includes(query));
+            }
+
+            const [sortKey, sortDir] = sortVal.split('-');
+            metrics.sort((a, b) => {
+                let va, vb;
+                switch (sortKey) {
+                    case 'nombre': va = a.nombre; vb = b.nombre; return sortDir === 'asc' ? va.localeCompare(vb) : vb.localeCompare(va);
+                    case 'valor_neto': va = a.valor_neto; vb = b.valor_neto; break;
+                    case 'cantidad': va = a.cantidad; vb = b.cantidad; break;
+                    case 'margen': va = a.margen_total; vb = b.margen_total; break;
+                    case 'registros': va = a.total_registros; vb = b.total_registros; break;
+                    default: return 0;
+                }
+                return sortDir === 'desc' ? vb - va : va - vb;
+            });
+
+            renderEntities(metrics);
+        }
+
+        function renderEntities(metrics) {
+            const grid = document.getElementById('entityGrid');
+            const noResults = document.getElementById('noResults');
+            document.getElementById('entityCount').textContent = metrics.length;
+
+            if (metrics.length === 0) {
+                grid.innerHTML = '';
+                noResults.style.display = 'block';
+                return;
+            }
+            noResults.style.display = 'none';
+
+            grid.innerHTML = metrics.map(m => {
+                const margenClass = m.margen_total > 30 ? 'high' : m.margen_total > 15 ? 'mid' : 'low';
+                const primaryDim = appData.primary_dimension;
+                return `
+                    <div class="entity-card">
+                        <div class="name">${escHtml(m.nombre)}</div>
+                        <div class="metrics">
+                            <div class="metric">
+                                <div class="mlabel">Valor Neto</div>
+                                <div class="mval" style="color:var(--green);">${formatCurrency(m.valor_neto)}</div>
+                            </div>
+                            <div class="metric">
+                                <div class="mlabel">Cantidad</div>
+                                <div class="mval" style="color:var(--accent-light);">${formatNum(m.cantidad)}</div>
+                            </div>
+                            <div class="metric">
+                                <div class="mlabel">Utilidad</div>
+                                <div class="mval" style="color:var(--yellow);">${formatCurrency(m.utilidad_total)}</div>
+                            </div>
+                            <div class="metric">
+                                <div class="mlabel">Docs</div>
+                                <div class="mval" style="color:var(--blue);">${m.documentos_unicos}</div>
+                            </div>
+                        </div>
+                        <div style="display:flex; justify-content:space-between; align-items:center; margin-top:10px;">
+                            <span class="margen-badge ${margenClass}">Margen: ${m.margen_total}%</span>
+                            <span style="font-size:0.75rem; color:var(--text-muted);">${m.total_registros} registros</span>
+                        </div>
+                        <button class="analyze-btn" onclick="analyzeEntity('${escHtml(primaryDim)}', '${escHtml(m.nombre)}')">
+                            Generar informe
+                        </button>
+                        <div class="card-actions">
+                            <button class="btn btn-word" onclick="downloadReport('${escHtml(primaryDim)}', '${escHtml(m.nombre)}', 'word')">Word</button>
+                            <button class="btn btn-excel" onclick="downloadReport('${escHtml(primaryDim)}', '${escHtml(m.nombre)}', 'excel')">Excel</button>
+                        </div>
+                    </div>
+                `;
+            }).join('');
+        }
+
+        async function applyFilters() {
+            const selects = document.querySelectorAll('#filterGrid select');
+            const filters = {};
+            selects.forEach(sel => {
+                const key = sel.dataset.key;
+                const val = sel.value;
+                if (val && val !== '__ALL__') {
+                    filters[key] = val;
+                }
+            });
+            currentFilters = filters;
+
+            const loading = document.getElementById('filterStatus');
+            loading.textContent = 'Aplicando filtros...';
+
+            try {
+                const res = await fetch(`${API_BASE}/refilter?filters=${encodeURIComponent(JSON.stringify(filters))}`, { method: 'POST' });
+                const data = await res.json();
+                if (data.success) {
+                    appData = await (await fetch(`${API_BASE}/data`)).json();
+                    renderDashboard();
+                    loading.textContent = 'Filtros aplicados';
+                    setTimeout(() => { loading.textContent = ''; }, 2000);
+                } else {
+                    loading.textContent = 'Error aplicando filtros';
+                }
+            } catch (e) {
+                loading.textContent = 'Error de conexion';
+                console.error(e);
+            }
+        }
+
+        function resetFilters() {
+            currentFilters = {};
+            applyFilters();
+        }
+
+        async function analyzeEntity(dimKey, entityName) {
+            const key = getApiKey();
+            if (!key) { showToast('Ingresa tu API key', 'error'); return; }
+
+            currentReportEntity = entityName;
+            currentReportDim = dimKey;
+            const modal = document.getElementById('reportModal');
+            document.getElementById('reportTitle').textContent = `Informe: ${entityName}`;
+            document.getElementById('reportDownloadBar').style.display = 'none';
+            document.getElementById('reportBody').innerHTML = '<div style="text-align:center; padding:40px;"><div class="spinner"></div><div style="margin-top:15px; color:var(--text-secondary);">Generando informe...</div></div>';
+            modal.classList.add('active');
+
+            try {
+                const provider = document.getElementById('aiProvider').value;
+                const filtersStr = encodeURIComponent(JSON.stringify(currentFilters));
+                const res = await fetch(`${API_BASE}/analyze/${encodeURIComponent(dimKey)}/${encodeURIComponent(entityName)}?filters=${filtersStr}`, {
+                    method: 'POST',
+                    headers: { 'X-Api-Key': key, 'X-Provider': provider },
+                });
+                const data = await res.json();
+                if (!res.ok) {
+                    document.getElementById('reportBody').innerHTML = `<div style="color:var(--red); padding:20px;">${escHtml(data.detail || 'Error generando informe')}</div>`;
+                    return;
+                }
+                document.getElementById('reportBody').innerHTML = renderMarkdown(data.informe);
+                document.getElementById('reportDownloadBar').style.display = 'flex';
+            } catch (err) {
+                document.getElementById('reportBody').innerHTML = `<div style="color:var(--red); padding:20px;">Error de conexion: ${escHtml(err.message)}</div>`;
+            }
+        }
+
+        function closeReport() { document.getElementById('reportModal').classList.remove('active'); }
+        document.getElementById('reportModal').addEventListener('click', (e) => { if (e.target === e.currentTarget) closeReport(); });
+
+        async function verifyApiKey() {
+            const key = document.getElementById('apiKey').value.trim();
+            const badge = document.getElementById('apiKeyBadge');
+            const btn = document.getElementById('verifyBtn');
+            if (!key) { showToast('Ingresa una API key primero', 'error'); return; }
+
+            btn.disabled = true;
+            btn.innerHTML = '<span class="spinner" style="width:14px;height:14px;border-width:2px;"></span>';
+            badge.style.display = 'inline-flex';
+            badge.className = 'api-key-badge';
+            badge.innerHTML = '<span class="spinner" style="width:12px;height:12px;border-width:2px;"></span> Verificando...';
+            badge.style.background = 'var(--blue-bg)';
+            badge.style.color = 'var(--blue)';
+            badge.style.border = '1px solid var(--blue)';
+
+            try {
+                const provider = document.getElementById('aiProvider').value;
+                const res = await fetch(`${API_BASE}/verify-key`, {
+                    method: 'POST',
+                    headers: { 'X-Api-Key': key, 'X-Provider': provider },
+                });
+                const data = await res.json();
+                if (res.ok) {
+                    badge.className = 'api-key-badge ok';
+                    badge.innerHTML = '&#10003; ' + (data.model || 'Conectado');
+                    showToast('Conectado con ' + (data.model || provider), 'success');
+                } else {
+                    badge.className = 'api-key-badge error';
+                    badge.innerHTML = '&#10007; ' + (data.detail || 'Error');
+                    showToast(data.detail || 'Error verificando API key', 'error');
+                }
+            } catch (err) {
+                badge.className = 'api-key-badge error';
+                badge.textContent = 'Error de conexion';
+                showToast('Error de conexion con el servidor', 'error');
+            } finally {
+                btn.disabled = false;
+                btn.innerHTML = 'Verificar';
+            }
+        }
+
+        function getApiKey() { return document.getElementById('apiKey').value.trim(); }
+
+        function onProviderChange() {
+            const provider = document.getElementById('aiProvider').value;
+            const input = document.getElementById('apiKey');
+            const placeholders = { gemini: 'AIzaSy...', claude: 'sk-ant-...', openai: 'sk-...' };
+            input.placeholder = placeholders[provider] || 'Tu API key...';
+            document.getElementById('apiKeyBadge').style.display = 'none';
+        }
+
+        document.getElementById('apiKey').addEventListener('keydown', (e) => { if (e.key === 'Enter') verifyApiKey(); });
+        document.getElementById('apiKey').addEventListener('input', () => {
+            const badge = document.getElementById('apiKeyBadge');
+            badge.style.display = 'none'; badge.className = 'api-key-badge'; badge.innerHTML = ''; badge.style = '';
+        });
+
+        function formatNum(n) {
+            if (n === null || n === undefined) return '-';
+            return Number(n).toLocaleString('es-CO', { maximumFractionDigits: 0 });
+        }
+
+        function formatCurrency(n) {
+            if (n === null || n === undefined) return '-';
+            return '$' + Number(n).toLocaleString('es-CO', { maximumFractionDigits: 0 });
+        }
+
+        function escHtml(s) {
+            if (!s) return '';
+            return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+        }
+
+        function renderMarkdown(text) {
+            if (!text) return '';
+            let html = escHtml(text);
+            html = html.replace(/^### (.+)$/gm, '<h3>$1</h3>');
+            html = html.replace(/^## (.+)$/gm, '<h3 style="font-size:1.15rem;">$1</h3>');
+            html = html.replace(/^# (.+)$/gm, '<h3 style="font-size:1.25rem;">$1</h3>');
+            html = html.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+            html = html.replace(/\*(.+?)\*/g, '<em>$1</em>');
+            html = html.replace(/^- (.+)$/gm, '<li>$1</li>');
+            html = html.replace(/^(\d+)\. (.+)$/gm, '<li>$2</li>');
+            html = html.replace(/(<li>.*<\/li>)/gs, '<ul>$1</ul>');
+            html = html.replace(/<\/ul>\s*<ul>/g, '');
+            html = html.replace(/\n{2,}/g, '<br><br>');
+            html = html.replace(/\n/g, '<br>');
+            return html;
+        }
+
+        function showToast(msg, type) {
+            if (toastTimer) clearTimeout(toastTimer);
+            const toast = document.getElementById('toast');
+            toast.textContent = msg;
+            toast.className = `toast ${type} show`;
+            toastTimer = setTimeout(() => { toast.className = 'toast'; }, 4000);
+        }
+
+        function clearData() {
+            appData = null;
+            currentReportEntity = '';
+            currentReportDim = '';
+            currentFilters = {};
+            tableState = { page: 1, pageSize: 50, sortCol: null, sortAsc: true, search: '' };
+            document.getElementById('dashboard').style.display = 'none';
+            document.getElementById('emptyState').style.display = 'block';
+            document.getElementById('clearBtn').style.display = 'none';
+            document.getElementById('fileName').style.display = 'none';
+            document.getElementById('searchInput').value = '';
+            document.getElementById('tableSearch').value = '';
+            document.getElementById('dataTableSection').style.display = 'none';
+            document.getElementById('pivotSection').style.display = 'none';
+            fileInput.value = '';
+            showToast('Datos limpiados', 'success');
+        }
+
+        async function downloadReport(dimKey, entityName, format) {
+            if (!appData) { showToast('Primero carga un archivo Excel', 'error'); return; }
+            currentReportEntity = entityName;
+            currentReportDim = dimKey;
+            showToast(`Descargando informe de ${entityName}...`, 'success');
+
+            try {
+                const filtersStr = encodeURIComponent(JSON.stringify(currentFilters));
+                const res = await fetch(`${API_BASE}/download/${encodeURIComponent(dimKey)}/${encodeURIComponent(entityName)}/${format}?filters=${filtersStr}`);
+                if (!res.ok) {
+                    let msg = 'Error al descargar';
+                    try { const data = await res.json(); msg = data.detail || msg; } catch (e) {}
+                    showToast(msg, 'error');
+                    return;
+                }
+                const blob = await res.blob();
+                const ext = format === 'word' ? 'docx' : 'xlsx';
+                const safeName = entityName.replace(/\s+/g, '_').replace(/\./g, '').replace(/\//g, '_');
+                const filename = `Informe_${safeName}.${ext}`;
+                const url = window.URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url; a.download = filename;
+                document.body.appendChild(a); a.click();
+                document.body.removeChild(a); window.URL.revokeObjectURL(url);
+                showToast(`Archivo descargado: ${filename}`, 'success');
+            } catch (err) {
+                showToast('Error de conexion al descargar', 'error');
+                console.error(err);
+            }
+        }
+
+        async function downloadCurrentReport(format) {
+            if (currentReportEntity) {
+                await downloadReport(currentReportDim, currentReportEntity, format);
+            }
+        }
+
+        async function loadTableData() {
+            const section = document.getElementById('dataTableSection');
+            section.style.display = 'block';
+            document.getElementById('tableRowCount').textContent = 'Cargando...';
+
+            try {
+                const params = new URLSearchParams({
+                    page: tableState.page,
+                    page_size: tableState.pageSize,
+                });
+                if (tableState.sortCol) {
+                    params.set('sort_column', tableState.sortCol);
+                    params.set('sort_ascending', tableState.sortAsc);
+                }
+                if (tableState.search) {
+                    params.set('search', tableState.search);
+                }
+
+                const res = await fetch(`${API_BASE}/table-data?${params.toString()}`);
+                if (!res.ok) {
+                    const errData = await res.json().catch(() => ({}));
+                    document.getElementById('tableRowCount').textContent = 'Error';
+                    showToast(errData.detail || 'Error cargando tabla', 'error');
+                    return;
+                }
+                const data = await res.json();
+                renderTableHeader(data.headers, data.sort_column, data.sort_ascending);
+                renderTableBody(data.headers, data.rows);
+                renderTablePagination(data);
+                document.getElementById('tableRowCount').textContent = data.total_rows.toLocaleString('es-CO') + ' registros';
+            } catch (err) {
+                document.getElementById('tableRowCount').textContent = 'Error';
+                console.error(err);
+            }
+        }
+
+        function renderTableHeader(headers, sortCol, sortAsc) {
+            const thead = document.getElementById('dataTableHead');
+            thead.innerHTML = '<tr>' + headers.map(h => {
+                const isSorted = tableState.sortCol === h.key;
+                const arrow = isSorted ? (tableState.sortAsc ? '&#9650;' : '&#9660;') : '&#9660;';
+                const cls = isSorted ? ' class="sorted"' : '';
+                return `<th${cls} onclick="onTableSort('${escHtml(h.key)}')">${escHtml(h.label)} <span class="sort-arrow">${arrow}</span></th>`;
+            }).join('') + '</tr>';
+        }
+
+        function renderTableBody(headers, rows) {
+            const tbody = document.getElementById('dataTableBody');
+            if (rows.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="' + headers.length + '" style="text-align:center; padding:30px; color:var(--text-muted);">No se encontraron registros</td></tr>';
+                return;
+            }
+            tbody.innerHTML = rows.map(row => {
+                return '<tr>' + headers.map(h => {
+                    const val = row[h.key];
+                    if (val === null || val === undefined || val === 'None' || val === 'nan') {
+                        return '<td class="null-val">-</td>';
+                    }
+                    let formatted = val;
+                    if (h.key === 'fecha' && val) {
+                        formatted = val;
+                    } else if (['valor_subtotal','valor_neto','valor_neto_local','valor_descuentos',
+                                 'costo_total','costo_cif','utilidad','margen',
+                                 'precio_unit','costo_uni'].includes(h.key) && typeof val === 'number') {
+                        if (h.key === 'margen') {
+                            formatted = val.toFixed(1) + '%';
+                        } else {
+                            formatted = '$' + val.toLocaleString('es-CO', {maximumFractionDigits: 0});
+                        }
+                    } else if (h.key === 'cantidad' && typeof val === 'number') {
+                        formatted = val.toLocaleString('es-CO', {maximumFractionDigits: 0});
+                    }
+                    return `<td title="${escHtml(String(val))}">${formatted}</td>`;
+                }).join('') + '</tr>';
+            }).join('');
+        }
+
+        function renderTablePagination(data) {
+            const info = document.getElementById('tableInfo');
+            const start = (data.current_page - 1) * data.page_size + 1;
+            const end = Math.min(data.current_page * data.page_size, data.total_rows);
+            info.textContent = `Mostrando ${start.toLocaleString('es-CO')}-${end.toLocaleString('es-CO')} de ${data.total_rows.toLocaleString('es-CO')} registros`;
+
+            const pag = document.getElementById('tablePagination');
+            let html = '';
+            html += `<button ${data.current_page <= 1 ? 'disabled' : ''} onclick="onTablePage(1)" title="Primera">&laquo;</button>`;
+            html += `<button ${data.current_page <= 1 ? 'disabled' : ''} onclick="onTablePage(${data.current_page - 1})" title="Anterior">&lsaquo;</button>`;
+
+            const range = 2;
+            let pages = [];
+            for (let i = Math.max(1, data.current_page - range); i <= Math.min(data.total_pages, data.current_page + range); i++) {
+                pages.push(i);
+            }
+            if (pages[0] > 1) { pages.unshift('...'); }
+            if (pages[pages.length - 1] < data.total_pages) { pages.push('...'); }
+
+            pages.forEach(p => {
+                if (p === '...') {
+                    html += `<span class="page-info">...</span>`;
+                } else {
+                    const active = p === data.current_page ? ' active' : '';
+                    html += `<button class="${active}" onclick="onTablePage(${p})">${p}</button>`;
+                }
+            });
+
+            html += `<button ${data.current_page >= data.total_pages ? 'disabled' : ''} onclick="onTablePage(${data.current_page + 1})" title="Siguiente">&rsaquo;</button>`;
+            html += `<button ${data.current_page >= data.total_pages ? 'disabled' : ''} onclick="onTablePage(${data.total_pages})" title="Ultima">&raquo;</button>`;
+            pag.innerHTML = html;
+        }
+
+        function onTableSort(colKey) {
+            if (tableState.sortCol === colKey) {
+                tableState.sortAsc = !tableState.sortAsc;
+            } else {
+                tableState.sortCol = colKey;
+                tableState.sortAsc = true;
+            }
+            tableState.page = 1;
+            loadTableData();
+        }
+
+        function onTablePage(page) {
+            tableState.page = page;
+            loadTableData();
+        }
+
+        function onTableSearch() {
+            clearTimeout(tableSearchTimer);
+            tableSearchTimer = setTimeout(() => {
+                tableState.search = document.getElementById('tableSearch').value.trim();
+                tableState.page = 1;
+                loadTableData();
+            }, 300);
+        }
+
+        function onPageSizeChange() {
+            tableState.pageSize = parseInt(document.getElementById('pageSizeSelect').value);
+            tableState.page = 1;
+            loadTableData();
+        }
+    </script>
+
+</body>
+</html>
