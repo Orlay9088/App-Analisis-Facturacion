@@ -826,11 +826,11 @@
             formData.append('file', file);
             loadingBar.classList.add('active');
             uploadZone.style.opacity = '0.5';
-            showToast('Subiendo archivo... El servidor puede tardar hasta 1 minuto en despertar.', 'info');
+            showToast('Subiendo archivo... El servidor puede tardar hasta 2 minutos en despertar.', 'info');
 
             try {
                 const controller = new AbortController();
-                const timeoutId = setTimeout(() => controller.abort(), 60000);
+                const timeoutId = setTimeout(() => controller.abort(), 180000);
                 const res = await fetch(`${API_BASE}/upload`, { method: 'POST', body: formData, signal: controller.signal });
                 clearTimeout(timeoutId);
                 if (!res.ok) {
